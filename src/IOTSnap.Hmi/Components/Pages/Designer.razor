@@ -381,6 +381,60 @@
                     <input @bind="_selectedEditorWidget.PropertiesJson" />
                 </label>
             </div>
+            <div class="hmi-form-grid hmi-form-grid-4">
+                <label>
+                    <span>Property</span>
+                    <input @bind="_selectedEditorWidget.Properties.Property" />
+                </label>
+                <label>
+                    <span>Unit</span>
+                    <input @bind="_selectedEditorWidget.Properties.Unit" />
+                </label>
+                <label>
+                    <span>Scale</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.DisplayScale" />
+                </label>
+                <label>
+                    <span>Offset</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.DisplayOffset" />
+                </label>
+            </div>
+            <div class="hmi-form-grid hmi-form-grid-4">
+                <label>
+                    <span>Decimal Places</span>
+                    <input type="number" min="0" @bind="_selectedEditorWidget.Properties.DecimalPlaces" />
+                </label>
+                <label>
+                    <span>Value Min</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.ValueMin" />
+                </label>
+                <label>
+                    <span>Value Max</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.ValueMax" />
+                </label>
+                <label>
+                    <span>Input Step</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.InputStep" />
+                </label>
+            </div>
+            <div class="hmi-form-grid hmi-form-grid-4">
+                <label>
+                    <span>Input Min</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.InputMin" />
+                </label>
+                <label>
+                    <span>Input Max</span>
+                    <input type="number" step="0.01" @bind="_selectedEditorWidget.Properties.InputMax" />
+                </label>
+                <label>
+                    <span>Input Mode</span>
+                    <input @bind="_selectedEditorWidget.Properties.InputMode" />
+                </label>
+                <label>
+                    <span>Input Label</span>
+                    <input @bind="_selectedEditorWidget.Properties.InputLabel" />
+                </label>
+            </div>
 
             <div class="binding-editor-list">
                 <div class="inline-action-row">
@@ -1207,6 +1261,7 @@
             Height = height;
             ZIndex = zIndex;
             PropertiesJson = propertiesJson;
+            Properties = HmiWidgetProperties.Parse(propertiesJson);
             Bindings = bindings.ToList();
         }
 
@@ -1219,6 +1274,7 @@
         public int Height { get; set; }
         public int ZIndex { get; set; }
         public string PropertiesJson { get; set; }
+        public HmiWidgetProperties Properties { get; set; }
         public List<WidgetBindingEditorItem> Bindings { get; set; }
     }
 
@@ -1510,6 +1566,7 @@
 
     private WidgetUpsertDto ToWidgetUpsertDto(WidgetEditorItem widget)
     {
+        widget.PropertiesJson = widget.Properties.ToJson();
         return new WidgetUpsertDto(
             widget.Key,
             widget.WidgetType,

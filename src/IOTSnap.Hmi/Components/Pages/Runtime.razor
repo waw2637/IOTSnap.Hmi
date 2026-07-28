@@ -1,7 +1,10 @@
 @page "/runtime/{Slug}"
 @attribute [Authorize]
 @inject HttpClient Http
+@inject IJSRuntime JS
 @implements IAsyncDisposable
+@using System.Globalization
+@using IOTSnap.Hmi.Features.Designer
 
 <PageTitle>Runtime Screen</PageTitle>
 
@@ -79,6 +82,14 @@ else
                 {
                     <div class="property-preview property-preview-text">@GetBindingHint(primaryBinding)</div>
                 }
+                @if (HasNumericInput(widget, primaryBinding))
+                {
+                    <div class="runtime-input-shell">
+                        <label class="touch-input-label">@GetInputLabel(widget, primaryBinding)</label>
+                        <input class="touch-input" type="number" inputmode="decimal" step="@GetInputStep(widget, primaryBinding)" min="@GetInputMin(widget, primaryBinding)" max="@GetInputMax(widget, primaryBinding)" value="@GetPendingInputValue(widget, primaryBinding)" @oninput="e => SetPendingInputValue(widget.Key, primaryBinding?.SourceKey ?? string.Empty, e.Value?.ToString() ?? string.Empty)" />
+                        <button class="hmi-primary-button touch-input-button" @onclick="() => WriteWidgetValueAsync(widget, primaryBinding)">Write</button>
+                    </div>
+                }
                 <div class="runtime-card-meta">
                     <span>Binding: @(primaryBinding?.SourceKey ?? "n/a")</span>
                     <span>Position: @widget.X,@widget.Y</span>
@@ -103,6 +114,7 @@ else
     private string _screenName = "Runtime Screen";
     private string? _error;
     private IReadOnlyList<RuntimeWidgetDto> _widgets = Array.Empty<RuntimeWidgetDto>();
+    private readonly Dictionary<string, string> _pendingInputValues = new(StringComparer.OrdinalIgnoreCase);
 
     protected override async Task OnParametersSetAsync()
     {
@@ -193,6 +205,69 @@ else
         return ValueTask.CompletedTask;
     }
 
+    private async Task WriteWidgetValueAsync(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        if (binding is null || string.IsNullOrWhiteSpace(binding.SourceKey))
+        {
+            return;
+        }
+
+        var key = GetInputKey(widget, binding);
+        var rawValue = _pendingInputValues.TryGetValue(key, out var pending) ? pending : string.Empty;
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            return;
+        }
+
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        if (decimal.TryParse(rawValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedValue))
+        {
+            if (properties.ValueMin is not null && parsedValue < properties.ValueMin.Value)
+            {
+                _error = $"Value must be at least {properties.ValueMin.Value}";
+                return;
+            }
+
+            if (properties.ValueMax is not null && parsedValue > properties.ValueMax.Value)
+            {
+                _error = $"Value must be at most {properties.ValueMax.Value}";
+                return;
+            }
+        }
+
+        var response = await Http.PostAsJsonAsync($"/api/hmi/runtime/write/{Uri.EscapeDataString(binding.SourceKey)}", new { value = rawValue });
+        if (!response.IsSuccessStatusCode)
+        {
+            _error = await response.Content.ReadAsStringAsync();
+            return;
+        }
+
+        _pendingInputValues[key] = rawValue;
+        _error = null;
+        await LoadPayloadAsync();
+    }
+
+    private static string GetWidgetValueText(RuntimeBindingDto? binding, RuntimeTagSnapshotDto? tag)
+    {
+        var valueText = tag?.ValueText;
+        if (string.IsNullOrWhiteSpace(valueText))
+        {
+            return "No value";
+        }
+
+        var properties = HmiWidgetProperties.Parse(binding?.PropertiesJson);
+        if (binding is not null && GetPropertyRole(binding) is "Text" or "Value")
+        {
+            return properties.FormatValue(valueText);
+        }
+
+        return GetPropertyRole(binding) switch
+        {
+            "TextList" => string.Join(" • ", valueText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+            _ => valueText
+        };
+    }
+
     private static RuntimeBindingDto? GetPreferredBinding(RuntimeWidgetDto? widget)
     {
         if (widget is null)
@@ -254,21 +329,6 @@ else
         };
     }
 
-    private static string GetWidgetValueText(RuntimeBindingDto? binding, RuntimeTagSnapshotDto? tag)
-    {
-        var valueText = tag?.ValueText;
-        if (string.IsNullOrWhiteSpace(valueText))
-        {
-            return "No value";
-        }
-
-        return GetPropertyRole(binding) switch
-        {
-            "TextList" => string.Join(" • ", valueText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
-            _ => valueText
-        };
-    }
-
     private static string GetColorValue(RuntimeTagSnapshotDto? tag)
     {
         if (tag is null || string.IsNullOrWhiteSpace(tag.ValueText))
@@ -315,6 +375,7 @@ else
         string SourceKey,
         bool WriteRequiresConfirm,
         string MinRole,
+        string PropertiesJson,
         RuntimeTagSnapshotDto? TagSnapshot);
 
     private sealed record RuntimeTagSnapshotDto(
@@ -325,4 +386,56 @@ else
         bool HasAlarm,
         string AlarmText,
         DateTimeOffset UpdatedUtc);
+
+    private static bool HasNumericInput(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        if (binding is null)
+        {
+            return false;
+        }
+
+        return GetPropertyRole(binding) is "Text" or "Value" || binding.BindingRole.Equals("Action", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetInputLabel(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return string.IsNullOrWhiteSpace(properties.InputLabel)
+            ? (string.IsNullOrWhiteSpace(binding?.SourceKey) ? "Set value" : binding.SourceKey)
+            : properties.InputLabel;
+    }
+
+    private static string GetInputStep(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return properties.InputStep.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static string GetInputMin(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return properties.InputMin?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
+    }
+
+    private static string GetInputMax(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return properties.InputMax?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
+    }
+
+    private string GetPendingInputValue(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var key = GetInputKey(widget, binding);
+        return _pendingInputValues.TryGetValue(key, out var pending) ? pending : string.Empty;
+    }
+
+    private void SetPendingInputValue(string widgetKey, string sourceKey, string value)
+    {
+        _pendingInputValues[$"{widgetKey}:{sourceKey}"] = value;
+    }
+
+    private static string GetInputKey(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        return $"{widget.Key}:{binding?.SourceKey ?? string.Empty}";
+    }
 }

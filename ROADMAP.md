@@ -10,6 +10,7 @@ This document captures the product direction for turning the current prototype i
 - Basic navigation between screens and multi-screen layouts
 - Faceplate/detail views for equipment and process objects
 - Tag quality/status indicators for connection and data validity
+- Touch-friendly numeric input popups with min/max validation and HMI-side scaling/offset formatting
 
 ### 2. Reliability and control
 - Better OPC UA reconnect and recovery behavior

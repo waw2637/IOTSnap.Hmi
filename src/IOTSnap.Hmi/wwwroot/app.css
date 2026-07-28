@@ -367,9 +367,31 @@ select {
     color: var(--hmi-muted);
 }
 
-.hmi-table {
+.touch-input-shell {
+    display: grid;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.touch-input-label {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--hmi-muted);
+}
+
+.touch-input {
     width: 100%;
-    border-collapse: collapse;
+    padding: 10px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--hmi-line);
+    background: rgba(255,255,255,0.94);
+    box-sizing: border-box;
+}
+
+.touch-input-button {
+    justify-self: start;
+    padding: 10px 16px;
+}
     margin-top: 14px;
 }
 

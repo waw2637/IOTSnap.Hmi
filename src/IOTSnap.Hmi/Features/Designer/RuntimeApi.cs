@@ -1,6 +1,7 @@
 using IOTSnap.Hmi.Data;
 using IOTSnap.Hmi.Data.Entities;
 using IOTSnap.Hmi.Runtime.OpcUa;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
 namespace IOTSnap.Hmi.Features.Designer;
@@ -13,7 +14,23 @@ public static class RuntimeApi
             .RequireAuthorization();
 
         group.MapGet("/screens/{slug}", GetPublishedScreenAsync);
+        group.MapPost("/write/{nodeId}", WriteTagAsync);
         return app;
+    }
+
+    private static async Task<IResult> WriteTagAsync(
+        string nodeId,
+        [FromBody] WriteTagRequest request,
+        IOpcUaRuntime runtime,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Value))
+        {
+            return Results.BadRequest("A value is required.");
+        }
+
+        var result = await runtime.WriteTagAsync(nodeId, request.Value, cancellationToken);
+        return result.Succeeded ? Results.Ok(new { result.Message, result.UpdatedUtc }) : Results.BadRequest(new { result.Message, result.UpdatedUtc });
     }
 
     private static async Task<IResult> GetPublishedScreenAsync(
@@ -49,6 +66,7 @@ public static class RuntimeApi
                         b.SourceKey,
                         b.WriteRequiresConfirm,
                         b.MinRole,
+                        x.PropertiesJson,
                         tagLookup.TryGetValue(b.SourceKey, out var tag)
                             ? new RuntimeTagSnapshotDto(
                                 tag.NodeId,
@@ -112,7 +130,10 @@ public static class RuntimeApi
         string SourceKey,
         bool WriteRequiresConfirm,
         string MinRole,
+        string PropertiesJson,
         RuntimeTagSnapshotDto? TagSnapshot);
+
+    private sealed record WriteTagRequest(string Value);
 
     private sealed record RuntimeTagSnapshotDto(
         string NodeId,
