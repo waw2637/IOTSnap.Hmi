@@ -1,0 +1,705 @@
+@page "/comms"
+@attribute [Authorize]
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+@inject IOpcUaRuntime OpcUaRuntime
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@implements IAsyncDisposable
+
+<PageTitle>Communications</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">OPC UA</div>
+        <h2>Communications</h2>
+    </div>
+    <p>Configure the active OPC UA endpoint and node mappings used by the local runtime.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">
+        @_message
+    </div>
+}
+
+<section class="dashboard-grid">
+    <article class="panel-card">
+        <div class="panel-label">Connection Status</div>
+        <div class="panel-metric panel-metric-sm">@(_runtimeStatus.IsConnected ? "Connected" : "Pending")</div>
+        <p>@_runtimeStatus.Detail</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Endpoint</div>
+        <div class="setting-key">@_profile?.EndpointUrl</div>
+        <p>@_profile?.SecurityMode / @_profile?.SecurityPolicy</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Auth Mode</div>
+        <div class="panel-metric panel-metric-sm">@_profile?.AuthenticationMode</div>
+        <p>Publishing interval: @_profile?.PublishingIntervalMs ms</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Configured Nodes</div>
+        <div class="panel-metric">@_nodes.Count</div>
+        <p>Write support should be added only after explicit authorization rules are in place.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Alarmed Tags</div>
+        <div class="panel-metric">@_alarmedTagCount</div>
+        <p>Tags with bad quality or stale values.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Stale Tags</div>
+        <div class="panel-metric">@_staleTagCount</div>
+        <p>No update within expected interval window.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Active Alarms</div>
+        <div class="panel-metric">@_activeAlarmCount</div>
+        <p>Persisted alarm records in active state.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Unacknowledged</div>
+        <div class="panel-metric">@_unacknowledgedAlarmCount</div>
+        <p>Require operator/admin acknowledgement.</p>
+    </article>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Connection Actions</div>
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="RefreshConnectionAsync">Refresh Connection</button>
+        <button class="hmi-ghost-button" @onclick="() => ToggleProfileEnabledAsync(_profile?.Enabled != true)">
+            @(_profile?.Enabled == true ? "Disable Profile" : "Enable Profile")
+        </button>
+    </div>
+    <ul class="diag-list">
+        <li class="diag-item">Use a reachable opc.tcp endpoint for a real PLC or keep the seeded demo profile for a local walkthrough.</li>
+        <li class="diag-item">Enable the profile only after the endpoint and credentials are verified.</li>
+        <li class="diag-item">Refresh the connection after changing the endpoint, security options, or mapped nodes.</li>
+    </ul>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Connection Profile</div>
+    @if (_profile is null)
+    {
+        <p>No profile configured.</p>
+    }
+    else
+    {
+        <div class="hmi-form-grid hmi-form-grid-3">
+            <label>
+                <span>Name</span>
+                <input @bind="_profile.Name" maxlength="128" />
+            </label>
+            <label>
+                <span>Endpoint URL</span>
+                <input @bind="_profile.EndpointUrl" maxlength="512" />
+            </label>
+            <label>
+                <span>Auth Mode</span>
+                <select @bind="_profile.AuthenticationMode">
+                    <option value="Anonymous">Anonymous</option>
+                    <option value="UsernamePassword">UsernamePassword</option>
+                </select>
+            </label>
+            <label>
+                <span>Security Policy</span>
+                <input @bind="_profile.SecurityPolicy" maxlength="64" />
+            </label>
+            <label>
+                <span>Security Mode</span>
+                <input @bind="_profile.SecurityMode" maxlength="64" />
+            </label>
+            <label>
+                <span>Publishing Interval (ms)</span>
+                <input type="number" min="100" step="100" @bind="_profile.PublishingIntervalMs" />
+            </label>
+        </div>
+        <div class="hmi-form-grid hmi-form-grid-2">
+            <label>
+                <span>Username</span>
+                <input @bind="_profile.Username" maxlength="128" />
+            </label>
+            <label>
+                <span>Password</span>
+                <input type="password" @bind="_profile.Password" />
+            </label>
+        </div>
+        <div class="inline-action-row">
+            <label class="inline-checkbox">
+                <input type="checkbox" @bind="_profile.Enabled" />
+                <span>Enabled</span>
+            </label>
+            <label class="inline-checkbox">
+                <input type="checkbox" @bind="_profile.UseSecurity" />
+                <span>Use Security</span>
+            </label>
+        </div>
+        <div class="button-row">
+            <button class="hmi-primary-button" @onclick="SaveProfileAsync">Save Profile</button>
+        </div>
+    }
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Alarm State</div>
+    <table class="hmi-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>NodeId</th>
+                <th>State</th>
+                <th>Alarm</th>
+                <th>Last Raised</th>
+                <th>Acknowledged</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_alarms.Count == 0)
+            {
+                <tr>
+                    <td colspan="7">No alarm records.</td>
+                </tr>
+            }
+            else
+            {
+                @foreach (var alarm in _alarms)
+                {
+                    <tr>
+                        <td>@alarm.DisplayName</td>
+                        <td>@alarm.NodeId</td>
+                        <td>
+                            @if (alarm.IsActive)
+                            {
+                                <span class="alarm-chip">Active</span>
+                            }
+                            else
+                            {
+                                <span>Cleared</span>
+                            }
+                        </td>
+                        <td>@alarm.AlarmText</td>
+                        <td>@alarm.LastRaisedUtc.ToString("u")</td>
+                        <td>
+                            @if (alarm.IsAcknowledged)
+                            {
+                                <span>@(alarm.AcknowledgedBy ?? "unknown") @alarm.AcknowledgedUtc?.ToString("u")</span>
+                            }
+                            else
+                            {
+                                <span>Not acknowledged</span>
+                            }
+                        </td>
+                        <td>
+                            @if (!_canAcknowledge)
+                            {
+                                <span>Read only role</span>
+                            }
+                            else if (alarm.IsAcknowledged)
+                            {
+                                <span>Acknowledged</span>
+                            }
+                            else
+                            {
+                                <button class="hmi-primary-button" @onclick="() => AcknowledgeAlarmAsync(alarm.NodeId)">Acknowledge</button>
+                            }
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Add Node Mapping</div>
+    <div class="hmi-form-grid hmi-form-grid-4">
+        <label>
+            <span>Display Name</span>
+            <input @bind="_newNode.DisplayName" maxlength="128" />
+        </label>
+        <label>
+            <span>NodeId</span>
+            <input @bind="_newNode.NodeId" maxlength="256" />
+        </label>
+        <label>
+            <span>Area</span>
+            <input @bind="_newNode.Area" maxlength="64" />
+        </label>
+        <label>
+            <span>Data Type</span>
+            <input @bind="_newNode.DataType" maxlength="32" />
+        </label>
+    </div>
+    <div class="hmi-form-grid hmi-form-grid-2">
+        <label>
+            <span>Sampling Interval (ms)</span>
+            <input type="number" min="100" step="100" @bind="_newNode.SamplingIntervalMs" />
+        </label>
+        <label class="inline-checkbox">
+            <input type="checkbox" @bind="_newNode.IsWritable" />
+            <span>Writable</span>
+        </label>
+    </div>
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="AddNodeAsync">Add Node</button>
+    </div>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Mapped Nodes</div>
+    <table class="hmi-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>NodeId</th>
+                <th>Area</th>
+                <th>Type</th>
+                <th>Writable</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_nodes.Count == 0)
+            {
+                <tr>
+                    <td colspan="6">No nodes configured.</td>
+                </tr>
+            }
+            else
+            {
+                @foreach (var node in _nodes)
+                {
+                    <tr>
+                        <td>@node.DisplayName</td>
+                        <td>@node.NodeId</td>
+                        <td>@node.Area</td>
+                        <td>@node.DataType</td>
+                        <td>@(node.IsWritable ? "Yes" : "No")</td>
+                        <td>
+                            <button class="hmi-ghost-button" @onclick="() => DeleteNodeAsync(node.Id)">Delete</button>
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Live Subscribed Values</div>
+    <table class="hmi-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>NodeId</th>
+                <th>Value</th>
+                <th>Status</th>
+                <th>Source Time (UTC)</th>
+                <th>Updated (UTC)</th>
+                <th>Alarm</th>
+                <th>Write</th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_tagSnapshots.Count == 0)
+            {
+                <tr>
+                    <td colspan="8">No live values yet. Confirm connection and mapped nodes.</td>
+                </tr>
+            }
+            else
+            {
+                @foreach (var tag in _tagSnapshots)
+                {
+                    <tr>
+                        <td>@tag.DisplayName</td>
+                        <td>@tag.NodeId</td>
+                        <td>@(string.IsNullOrWhiteSpace(tag.ValueText) ? "(null)" : tag.ValueText)</td>
+                        <td>@tag.StatusCode</td>
+                        <td>@(tag.SourceTimestampUtc?.ToString("u") ?? "n/a")</td>
+                        <td>@tag.UpdatedUtc.ToString("u")</td>
+                        <td>
+                            @if (tag.HasAlarm)
+                            {
+                                <span class="alarm-chip">@tag.AlarmText</span>
+                            }
+                            else
+                            {
+                                <span>OK</span>
+                            }
+                        </td>
+                        <td>
+                            @if (!_canWrite)
+                            {
+                                <span>Read only role</span>
+                            }
+                            else if (!tag.IsWritable)
+                            {
+                                <span>Read only tag</span>
+                            }
+                            else
+                            {
+                                <div class="inline-action-row">
+                                    <input
+                                        class="hmi-write-input"
+                                        value="@GetPendingWriteValue(tag)"
+                                        @oninput="e => SetPendingWriteValue(tag.NodeId, e.Value?.ToString() ?? string.Empty)" />
+                                    <button class="hmi-primary-button" @onclick="() => WriteTagAsync(tag)">Write</button>
+                                </div>
+                                @if (_writeResults.TryGetValue(tag.NodeId, out var writeResult))
+                                {
+                                    <div class="setting-value">@writeResult</div>
+                                }
+                            }
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+</section>
+
+@code {
+    private OpcUaRuntimeStatus _runtimeStatus = new();
+    private OpcUaConnectionProfile? _profile;
+    private List<OpcUaNodeMapping> _nodes = new();
+    private IReadOnlyList<OpcUaTagSnapshot> _tagSnapshots = Array.Empty<OpcUaTagSnapshot>();
+    private NodeDraft _newNode = new();
+    private string? _message;
+    private bool _messageIsError;
+    private bool _canWrite;
+    private bool _canAcknowledge;
+    private string _currentUsername = "operator";
+    private readonly CancellationTokenSource _pollingCts = new();
+    private Task? _pollingTask;
+    private readonly Dictionary<string, string> _pendingWrites = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _writeResults = new(StringComparer.OrdinalIgnoreCase);
+    private int _alarmedTagCount;
+    private int _staleTagCount;
+    private int _activeAlarmCount;
+    private int _unacknowledgedAlarmCount;
+    private IReadOnlyList<OpcUaAlarmSnapshot> _alarms = Array.Empty<OpcUaAlarmSnapshot>();
+
+    protected override async Task OnInitializedAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        var user = authState.User;
+        _canWrite = user.IsInRole(HmiRoles.Admin) || user.IsInRole(HmiRoles.Operator);
+        _canAcknowledge = _canWrite;
+        _currentUsername = user.Identity?.Name ?? user.Identity?.AuthenticationType ?? "operator";
+
+        await LoadStateAsync();
+        _pollingTask = PollRuntimeAsync(_pollingCts.Token);
+    }
+
+    private async Task LoadStateAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        _profile = await db.OpcUaConnectionProfiles
+            .Include(x => x.NodeMappings)
+            .OrderByDescending(x => x.UpdatedUtc)
+            .FirstOrDefaultAsync();
+        _nodes = _profile?.NodeMappings.OrderBy(x => x.DisplayName).ToList() ?? new();
+        _runtimeStatus = await OpcUaRuntime.GetStatusAsync();
+        _tagSnapshots = await OpcUaRuntime.GetTagSnapshotsAsync();
+        _alarms = await OpcUaRuntime.GetAlarmsAsync();
+        UpdateTagHealthCounts();
+        UpdateAlarmCounts();
+    }
+
+    private async Task PollRuntimeAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                _runtimeStatus = await OpcUaRuntime.GetStatusAsync(cancellationToken);
+                _tagSnapshots = await OpcUaRuntime.GetTagSnapshotsAsync(cancellationToken);
+                _alarms = await OpcUaRuntime.GetAlarmsAsync(false, cancellationToken);
+                ReconcilePendingWriteValues();
+                UpdateTagHealthCounts();
+                UpdateAlarmCounts();
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task RefreshConnectionAsync()
+    {
+        await OpcUaRuntime.RefreshNowAsync();
+        SetMessage("Connection refresh requested.", false);
+        await LoadStateAsync();
+    }
+
+    private async Task ToggleProfileEnabledAsync(bool enabled)
+    {
+        if (_profile is null)
+        {
+            SetMessage("No profile selected.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var persisted = await db.OpcUaConnectionProfiles.FirstOrDefaultAsync(x => x.Id == _profile.Id);
+        if (persisted is null)
+        {
+            SetMessage("Profile no longer exists.", true);
+            await LoadStateAsync();
+            return;
+        }
+
+        persisted.Enabled = enabled;
+        persisted.UpdatedUtc = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        await OpcUaRuntime.RefreshNowAsync();
+        SetMessage(enabled ? "Profile enabled." : "Profile disabled.", false);
+        await LoadStateAsync();
+    }
+
+    private async Task SaveProfileAsync()
+    {
+        if (_profile is null)
+        {
+            SetMessage("No profile selected.", true);
+            return;
+        }
+
+        if (!Uri.TryCreate(_profile.EndpointUrl, UriKind.Absolute, out var endpointUri)
+            || !string.Equals(endpointUri.Scheme, "opc.tcp", StringComparison.OrdinalIgnoreCase))
+        {
+            SetMessage("Endpoint URL must be an absolute opc.tcp URL.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var persisted = await db.OpcUaConnectionProfiles.FirstOrDefaultAsync(x => x.Id == _profile.Id);
+        if (persisted is null)
+        {
+            SetMessage("Profile no longer exists.", true);
+            await LoadStateAsync();
+            return;
+        }
+
+        persisted.Name = _profile.Name.Trim();
+        persisted.EndpointUrl = _profile.EndpointUrl.Trim();
+        persisted.AuthenticationMode = _profile.AuthenticationMode.Trim();
+        persisted.SecurityPolicy = _profile.SecurityPolicy.Trim();
+        persisted.SecurityMode = _profile.SecurityMode.Trim();
+        persisted.PublishingIntervalMs = Math.Max(100, _profile.PublishingIntervalMs);
+        persisted.Username = string.IsNullOrWhiteSpace(_profile.Username) ? null : _profile.Username.Trim();
+        persisted.Password = string.IsNullOrWhiteSpace(_profile.Password) ? null : _profile.Password;
+        persisted.Enabled = _profile.Enabled;
+        persisted.UseSecurity = _profile.UseSecurity;
+        persisted.UpdatedUtc = DateTimeOffset.UtcNow;
+
+        await db.SaveChangesAsync();
+        await OpcUaRuntime.RefreshNowAsync();
+        SetMessage("Profile saved.", false);
+        await LoadStateAsync();
+    }
+
+    private async Task AddNodeAsync()
+    {
+        if (_profile is null)
+        {
+            SetMessage("No profile selected.", true);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_newNode.DisplayName) || string.IsNullOrWhiteSpace(_newNode.NodeId))
+        {
+            SetMessage("Display name and NodeId are required.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var profile = await db.OpcUaConnectionProfiles.FirstOrDefaultAsync(x => x.Id == _profile.Id);
+        if (profile is null)
+        {
+            SetMessage("Profile no longer exists.", true);
+            await LoadStateAsync();
+            return;
+        }
+
+        db.OpcUaNodeMappings.Add(new OpcUaNodeMapping
+        {
+            OpcUaConnectionProfileId = profile.Id,
+            DisplayName = _newNode.DisplayName.Trim(),
+            NodeId = _newNode.NodeId.Trim(),
+            Area = string.IsNullOrWhiteSpace(_newNode.Area) ? "Default" : _newNode.Area.Trim(),
+            DataType = string.IsNullOrWhiteSpace(_newNode.DataType) ? "Auto" : _newNode.DataType.Trim(),
+            SamplingIntervalMs = Math.Max(100, _newNode.SamplingIntervalMs),
+            IsWritable = _newNode.IsWritable
+        });
+        profile.UpdatedUtc = DateTimeOffset.UtcNow;
+
+        await db.SaveChangesAsync();
+        await OpcUaRuntime.RefreshNowAsync();
+        _newNode = new NodeDraft();
+        SetMessage("Node added.", false);
+        await LoadStateAsync();
+    }
+
+    private async Task DeleteNodeAsync(int nodeId)
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var node = await db.OpcUaNodeMappings.FirstOrDefaultAsync(x => x.Id == nodeId);
+        if (node is null)
+        {
+            SetMessage("Node no longer exists.", true);
+            await LoadStateAsync();
+            return;
+        }
+
+        var profile = await db.OpcUaConnectionProfiles.FirstOrDefaultAsync(x => x.Id == node.OpcUaConnectionProfileId);
+        if (profile is not null)
+        {
+            profile.UpdatedUtc = DateTimeOffset.UtcNow;
+        }
+
+        db.OpcUaNodeMappings.Remove(node);
+        await db.SaveChangesAsync();
+        await OpcUaRuntime.RefreshNowAsync();
+        SetMessage("Node deleted.", false);
+        await LoadStateAsync();
+    }
+
+    private void SetMessage(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+
+    private string GetPendingWriteValue(OpcUaTagSnapshot tag)
+    {
+        if (_pendingWrites.TryGetValue(tag.NodeId, out var pending))
+        {
+            return pending;
+        }
+
+        return tag.ValueText ?? string.Empty;
+    }
+
+    private void SetPendingWriteValue(string nodeId, string value)
+    {
+        _pendingWrites[nodeId] = value;
+    }
+
+    private async Task WriteTagAsync(OpcUaTagSnapshot tag)
+    {
+        if (!_canWrite)
+        {
+            SetMessage("Your role is not allowed to write tags.", true);
+            return;
+        }
+
+        if (!tag.IsWritable)
+        {
+            SetMessage("Tag is read-only.", true);
+            return;
+        }
+
+        var value = GetPendingWriteValue(tag);
+        var result = await OpcUaRuntime.WriteTagAsync(tag.NodeId, value);
+        _writeResults[tag.NodeId] = result.Message;
+
+        if (!result.Succeeded)
+        {
+            SetMessage(result.Message, true);
+            return;
+        }
+
+        SetMessage($"Write sent for {tag.DisplayName}.", false);
+    }
+
+    private void ReconcilePendingWriteValues()
+    {
+        var existingNodeIds = _tagSnapshots
+            .Select(x => x.NodeId)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var stalePending = _pendingWrites.Keys
+            .Where(x => !existingNodeIds.Contains(x))
+            .ToList();
+
+        foreach (var nodeId in stalePending)
+        {
+            _pendingWrites.Remove(nodeId);
+            _writeResults.Remove(nodeId);
+        }
+    }
+
+    private void UpdateTagHealthCounts()
+    {
+        _alarmedTagCount = _tagSnapshots.Count(x => x.HasAlarm);
+        _staleTagCount = _tagSnapshots.Count(x => x.IsStale);
+    }
+
+    private void UpdateAlarmCounts()
+    {
+        _activeAlarmCount = _alarms.Count(x => x.IsActive);
+        _unacknowledgedAlarmCount = _alarms.Count(x => !x.IsAcknowledged);
+    }
+
+    private async Task AcknowledgeAlarmAsync(string nodeId)
+    {
+        if (!_canAcknowledge)
+        {
+            SetMessage("Your role is not allowed to acknowledge alarms.", true);
+            return;
+        }
+
+        var result = await OpcUaRuntime.AcknowledgeAlarmAsync(nodeId, _currentUsername);
+        SetMessage(result.Message, !result.Succeeded);
+
+        if (result.Succeeded)
+        {
+            _alarms = await OpcUaRuntime.GetAlarmsAsync();
+            UpdateAlarmCounts();
+        }
+    }
+
+    private sealed class NodeDraft
+    {
+        public string DisplayName { get; set; } = string.Empty;
+        public string NodeId { get; set; } = string.Empty;
+        public string Area { get; set; } = "Default";
+        public string DataType { get; set; } = "Auto";
+        public int SamplingIntervalMs { get; set; } = 1000;
+        public bool IsWritable { get; set; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _pollingCts.Cancel();
+
+        if (_pollingTask is not null)
+        {
+            try
+            {
+                await _pollingTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        _pollingCts.Dispose();
+    }
+}

@@ -1,0 +1,16 @@
+<CascadingAuthenticationState>
+    <Router AppAssembly="typeof(Program).Assembly" NotFoundPage="typeof(Pages.NotFound)">
+        <Found Context="routeData">
+            <AuthorizeRouteView RouteData="routeData" DefaultLayout="typeof(Layout.MainLayout)">
+                <NotAuthorized>
+                    <section class="panel-card">
+                        <div class="panel-label">Access Required</div>
+                        <h2>Sign in to continue.</h2>
+                        <p><a href="/login">Open the login screen</a></p>
+                    </section>
+                </NotAuthorized>
+            </AuthorizeRouteView>
+            <FocusOnNavigate RouteData="routeData" Selector="h1" />
+        </Found>
+    </Router>
+</CascadingAuthenticationState>

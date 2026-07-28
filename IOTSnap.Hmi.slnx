@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/IOTSnap.Hmi.Data/IOTSnap.Hmi.Data.csproj" />
+    <Project Path="src/IOTSnap.Hmi.Runtime/IOTSnap.Hmi.Runtime.csproj" />
+    <Project Path="src/IOTSnap.Hmi/IOTSnap.Hmi.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/IOTSnap.Hmi.Tests/IOTSnap.Hmi.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,219 @@
+@page "/users"
+@attribute [Authorize(Roles = HmiRoles.Admin)]
+@using Microsoft.AspNetCore.Identity
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+@inject IPasswordHasher<LocalUser> PasswordHasher
+
+<PageTitle>Users</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">Access Control</div>
+        <h2>Local Users</h2>
+    </div>
+    <p>Users are stored locally right now to keep the runtime independent of external identity systems.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">
+        @_message
+    </div>
+}
+
+<section class="panel-card">
+    <div class="panel-label">Create User</div>
+    <div class="hmi-form-grid hmi-form-grid-4">
+        <label>
+            <span>Username</span>
+            <input @bind="_newUsername" maxlength="64" />
+        </label>
+        <label>
+            <span>Display Name</span>
+            <input @bind="_newDisplayName" maxlength="128" />
+        </label>
+        <label>
+            <span>Role</span>
+            <select @bind="_newRole">
+                @foreach (var role in _roles)
+                {
+                    <option value="@role">@role</option>
+                }
+            </select>
+        </label>
+        <label>
+            <span>Password</span>
+            <input type="password" @bind="_newPassword" />
+        </label>
+    </div>
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="CreateUserAsync">Create User</button>
+    </div>
+</section>
+
+<section class="panel-card">
+    <table class="hmi-table">
+        <thead>
+            <tr>
+                <th>Username</th>
+                <th>Display Name</th>
+                <th>Role</th>
+                <th>Enabled</th>
+                <th>Last Login</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var row in _users)
+            {
+                <tr>
+                    <td>@row.User.Username</td>
+                    <td>@row.User.DisplayName</td>
+                    <td>@row.User.Role</td>
+                    <td>@(row.User.IsEnabled ? "Yes" : "No")</td>
+                    <td>@(row.User.LastLoginUtc?.ToString("u") ?? "Never")</td>
+                    <td>
+                        <div class="table-action-stack">
+                            <button class="hmi-ghost-button" @onclick="() => ToggleUserAsync(row)">
+                                @(row.User.IsEnabled ? "Disable" : "Enable")
+                            </button>
+                            <div class="inline-action-row">
+                                <input type="password" placeholder="New password" @bind="row.NewPassword" />
+                                <button class="hmi-primary-button" @onclick="() => SetPasswordAsync(row)">Set Password</button>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+</section>
+
+@code {
+    private static readonly string[] _roles = [HmiRoles.Admin, HmiRoles.Operator, HmiRoles.Viewer];
+    private List<UserRow> _users = new();
+    private string _newUsername = string.Empty;
+    private string _newDisplayName = string.Empty;
+    private string _newRole = HmiRoles.Operator;
+    private string _newPassword = string.Empty;
+    private string? _message;
+    private bool _messageIsError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadUsersAsync();
+    }
+
+    private async Task LoadUsersAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        _users = await db.LocalUsers
+            .OrderBy(x => x.Username)
+            .Select(x => new UserRow
+            {
+                User = x,
+                NewPassword = string.Empty
+            })
+            .ToListAsync();
+    }
+
+    private async Task CreateUserAsync()
+    {
+        var username = _newUsername.Trim();
+        var displayName = _newDisplayName.Trim();
+
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(_newPassword))
+        {
+            SetMessage("Username and password are required.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var exists = await db.LocalUsers.AnyAsync(x => x.Username == username);
+        if (exists)
+        {
+            SetMessage("A user with that username already exists.", true);
+            return;
+        }
+
+        var user = new LocalUser
+        {
+            Username = username,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? username : displayName,
+            Role = _roles.Contains(_newRole) ? _newRole : HmiRoles.Viewer,
+            IsEnabled = true
+        };
+        user.PasswordHash = PasswordHasher.HashPassword(user, _newPassword);
+        db.LocalUsers.Add(user);
+        await db.SaveChangesAsync();
+
+        _newUsername = string.Empty;
+        _newDisplayName = string.Empty;
+        _newPassword = string.Empty;
+        SetMessage("User created.", false);
+        await LoadUsersAsync();
+    }
+
+    private async Task ToggleUserAsync(UserRow row)
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var user = await db.LocalUsers.FirstOrDefaultAsync(x => x.Id == row.User.Id);
+        if (user is null)
+        {
+            SetMessage("User no longer exists.", true);
+            await LoadUsersAsync();
+            return;
+        }
+
+        if (user.Username == "admin" && user.IsEnabled)
+        {
+            var enabledAdminCount = await db.LocalUsers.CountAsync(x => x.Role == HmiRoles.Admin && x.IsEnabled);
+            if (enabledAdminCount <= 1)
+            {
+                SetMessage("Cannot disable the last enabled admin.", true);
+                return;
+            }
+        }
+
+        user.IsEnabled = !user.IsEnabled;
+        await db.SaveChangesAsync();
+        SetMessage($"{user.Username} is now {(user.IsEnabled ? "enabled" : "disabled")}.", false);
+        await LoadUsersAsync();
+    }
+
+    private async Task SetPasswordAsync(UserRow row)
+    {
+        var newPassword = row.NewPassword.Trim();
+        if (string.IsNullOrWhiteSpace(newPassword))
+        {
+            SetMessage("Enter a new password before saving.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var user = await db.LocalUsers.FirstOrDefaultAsync(x => x.Id == row.User.Id);
+        if (user is null)
+        {
+            SetMessage("User no longer exists.", true);
+            await LoadUsersAsync();
+            return;
+        }
+
+        user.PasswordHash = PasswordHasher.HashPassword(user, newPassword);
+        await db.SaveChangesAsync();
+        SetMessage($"Password updated for {user.Username}.", false);
+        await LoadUsersAsync();
+    }
+
+    private void SetMessage(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+
+    private sealed class UserRow
+    {
+        public required LocalUser User { get; init; }
+        public string NewPassword { get; set; } = string.Empty;
+    }
+}

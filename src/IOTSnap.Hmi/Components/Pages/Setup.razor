@@ -1,0 +1,149 @@
+@page "/setup"
+@attribute [AllowAnonymous]
+@using Microsoft.AspNetCore.Identity
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+@inject IPasswordHasher<LocalUser> PasswordHasher
+@inject NavigationManager NavigationManager
+
+<PageTitle>Initial Setup</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">First Run</div>
+        <h2>Set up your local administrator</h2>
+    </div>
+    <p>Create the first administrator account and optionally seed a PLC endpoint for the comms experience.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">
+        @_message
+    </div>
+}
+
+<section class="panel-card">
+    <div class="panel-label">Admin Account</div>
+    <p>Use these values to unlock the designer, communications, and runtime pages for your local deployment.</p>
+    <div class="hmi-form-grid hmi-form-grid-3">
+        <label>
+            <span>Username</span>
+            <input @bind="_username" maxlength="64" />
+        </label>
+        <label>
+            <span>Display Name</span>
+            <input @bind="_displayName" maxlength="128" />
+        </label>
+        <label>
+            <span>OPC UA Endpoint (optional)</span>
+            <input @bind="_endpointUrl" maxlength="512" placeholder="opc.tcp://127.0.0.1:4840" />
+        </label>
+    </div>
+
+    <div class="hmi-form-grid hmi-form-grid-2">
+        <label>
+            <span>Password</span>
+            <input type="password" @bind="_password" />
+        </label>
+        <label>
+            <span>Confirm Password</span>
+            <input type="password" @bind="_confirmPassword" />
+        </label>
+    </div>
+
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="CompleteSetupAsync">Complete Setup</button>
+    </div>
+</section>
+
+<section class="stack-grid">
+    <article class="panel-card">
+        <div class="panel-label">What happens next</div>
+        <ul class="diag-list">
+            <li class="diag-item">You will be redirected to the sign-in screen with your new administrator account.</li>
+            <li class="diag-item">The communications page can then be used to connect to OPC UA or review the seeded demo profile.</li>
+            <li class="diag-item">The designer and runtime pages become available once you are signed in.</li>
+        </ul>
+    </article>
+</section>
+
+@code {
+    private string _username = "admin";
+    private string _displayName = "Local Administrator";
+    private string _password = string.Empty;
+    private string _confirmPassword = string.Empty;
+    private string _endpointUrl = string.Empty;
+    private string? _message;
+    private bool _messageIsError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var hasUsers = await db.LocalUsers.AnyAsync();
+        if (hasUsers)
+        {
+            NavigationManager.NavigateTo("/", true);
+        }
+    }
+
+    private async Task CompleteSetupAsync()
+    {
+        var username = _username.Trim();
+        var displayName = _displayName.Trim();
+
+        if (string.IsNullOrWhiteSpace(username)
+            || string.IsNullOrWhiteSpace(_password)
+            || string.IsNullOrWhiteSpace(_confirmPassword))
+        {
+            SetMessage("Username, password, and confirmation are required.", true);
+            return;
+        }
+
+        if (!string.Equals(_password, _confirmPassword, StringComparison.Ordinal))
+        {
+            SetMessage("Passwords do not match.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+
+        if (await db.LocalUsers.AnyAsync())
+        {
+            NavigationManager.NavigateTo("/", true);
+            return;
+        }
+
+        var admin = new LocalUser
+        {
+            Username = username,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? username : displayName,
+            Role = HmiRoles.Admin,
+            IsEnabled = true
+        };
+        admin.PasswordHash = PasswordHasher.HashPassword(admin, _password);
+        db.LocalUsers.Add(admin);
+
+        var endpoint = _endpointUrl.Trim();
+        if (!string.IsNullOrWhiteSpace(endpoint)
+            && Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri)
+            && string.Equals(endpointUri.Scheme, "opc.tcp", StringComparison.OrdinalIgnoreCase)
+            && !await db.OpcUaConnectionProfiles.AnyAsync())
+        {
+            db.OpcUaConnectionProfiles.Add(new OpcUaConnectionProfile
+            {
+                Name = "Primary PLC",
+                EndpointUrl = endpoint,
+                AuthenticationMode = "Anonymous"
+            });
+        }
+
+        await db.SaveChangesAsync();
+        NavigationManager.NavigateTo("/login?configured=1", true);
+    }
+
+    private void SetMessage(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+}

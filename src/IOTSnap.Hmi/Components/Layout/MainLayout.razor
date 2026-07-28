@@ -1,0 +1,44 @@
+@inherits LayoutComponentBase
+
+<div class="hmi-shell">
+    <header class="hmi-header">
+        <div>
+            <div class="hmi-kicker">IOTSnap HMI</div>
+            <div class="hmi-title-row">
+                <h1 class="hmi-title">Local Operator Interface</h1>
+                <span class="hmi-chip">Scaffold</span>
+            </div>
+        </div>
+
+        <AuthorizeView>
+            <Authorized>
+                <div class="hmi-header-actions">
+                    <nav class="hmi-nav">
+                        <a href="/">Overview</a>
+                        <a href="/designer">Designer</a>
+                        <a href="/settings">Settings</a>
+                        <a href="/comms">Communications</a>
+                        <a href="/runtime/main">Runtime</a>
+                        <a href="/users">Users</a>
+                    </nav>
+                    <form method="post" action="/logout">
+                        <button class="hmi-ghost-button" type="submit">Sign Out</button>
+                    </form>
+                </div>
+            </Authorized>
+            <NotAuthorized>
+                <a class="hmi-ghost-button" href="/login">Sign In</a>
+            </NotAuthorized>
+        </AuthorizeView>
+    </header>
+
+    <main class="hmi-main">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">x</span>
+</div>

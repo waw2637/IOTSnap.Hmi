@@ -1,0 +1,146 @@
+@page "/settings"
+@attribute [Authorize]
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+
+<PageTitle>Settings</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">Local Configuration</div>
+        <h2>Application Settings</h2>
+    </div>
+    <p>Manage local key/value settings stored in SQLite.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">
+        @_message
+    </div>
+}
+
+<section class="panel-card">
+    <div class="panel-label">Add Setting</div>
+    <div class="hmi-form-grid hmi-form-grid-3">
+        <label>
+            <span>Category</span>
+            <input @bind="_newCategory" maxlength="64" />
+        </label>
+        <label>
+            <span>Key</span>
+            <input @bind="_newKey" maxlength="128" />
+        </label>
+        <label>
+            <span>Value</span>
+            <input @bind="_newValue" />
+        </label>
+    </div>
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="AddSettingAsync">Add Setting</button>
+    </div>
+</section>
+
+<section class="stack-grid">
+    @if (_settings.Count == 0)
+    {
+        <article class="panel-card">
+            <p>No settings found.</p>
+        </article>
+    }
+    else
+    {
+        @foreach (var setting in _settings)
+        {
+            <article class="panel-card">
+                <div class="panel-label">@setting.Category</div>
+                <div class="setting-key">@setting.Key</div>
+                <label class="inline-field">
+                    <span>Value</span>
+                    <input @bind="setting.Value" />
+                </label>
+                <div class="button-row">
+                    <button class="hmi-primary-button" @onclick="() => SaveSettingAsync(setting)">Save</button>
+                </div>
+            </article>
+        }
+    }
+</section>
+
+@code {
+    private List<AppSetting> _settings = new();
+    private string _newCategory = "General";
+    private string _newKey = string.Empty;
+    private string _newValue = string.Empty;
+    private string? _message;
+    private bool _messageIsError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadSettingsAsync();
+    }
+
+    private async Task LoadSettingsAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        _settings = await db.AppSettings
+            .OrderBy(x => x.Category)
+            .ThenBy(x => x.Key)
+            .ToListAsync();
+    }
+
+    private async Task AddSettingAsync()
+    {
+        var key = _newKey.Trim();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            SetMessage("Setting key is required.", true);
+            return;
+        }
+
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var exists = await db.AppSettings.AnyAsync(x => x.Key == key);
+        if (exists)
+        {
+            SetMessage("A setting with that key already exists.", true);
+            return;
+        }
+
+        db.AppSettings.Add(new AppSetting
+        {
+            Category = string.IsNullOrWhiteSpace(_newCategory) ? "General" : _newCategory.Trim(),
+            Key = key,
+            Value = _newValue.Trim(),
+            UpdatedUtc = DateTimeOffset.UtcNow
+        });
+
+        await db.SaveChangesAsync();
+        _newKey = string.Empty;
+        _newValue = string.Empty;
+        SetMessage("Setting added.", false);
+        await LoadSettingsAsync();
+    }
+
+    private async Task SaveSettingAsync(AppSetting setting)
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var persisted = await db.AppSettings.FirstOrDefaultAsync(x => x.Id == setting.Id);
+        if (persisted is null)
+        {
+            SetMessage("Setting no longer exists.", true);
+            await LoadSettingsAsync();
+            return;
+        }
+
+        persisted.Value = setting.Value.Trim();
+        persisted.UpdatedUtc = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync();
+        SetMessage($"Saved {setting.Key}.", false);
+        await LoadSettingsAsync();
+    }
+
+    private void SetMessage(string message, bool isError)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+}

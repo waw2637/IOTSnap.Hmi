@@ -1,0 +1,71 @@
+@page "/login"
+@inject AuthenticationStateProvider AuthenticationStateProvider
+
+<PageTitle>Sign In</PageTitle>
+
+<section class="login-shell">
+    <div class="login-card">
+        <div class="hmi-kicker">Local Access</div>
+        <h1>Sign in to the HMI</h1>
+        <p>Use the local administrator account you created during setup to access the designer and operator tools.</p>
+
+        @if (_isAuthenticated)
+        {
+            <div class="notice-banner">
+                You are already signed in. <a href="@NormalizedReturnUrl">Continue</a>
+            </div>
+        }
+        else if (Error == "1")
+        {
+            <div class="notice-banner notice-banner-error">
+                The username or password was not accepted. Please try again with the local administrator account.
+            </div>
+        }
+        else if (Error == "configured")
+        {
+            <div class="notice-banner">
+                Setup is complete. Sign in with your new administrator account to continue.
+            </div>
+        }
+
+        <form method="post" action="/login" class="login-form">
+            <input type="hidden" name="returnUrl" value="@NormalizedReturnUrl" />
+
+            <label>
+                <span>Username</span>
+                <input name="username" autocomplete="username" placeholder="admin" />
+            </label>
+
+            <label>
+                <span>Password</span>
+                <input name="password" type="password" autocomplete="current-password" placeholder="Password" />
+            </label>
+
+            <button type="submit" class="hmi-primary-button">Sign In</button>
+        </form>
+    </div>
+</section>
+
+@code {
+    [SupplyParameterFromQuery(Name = "returnUrl")]
+    public string? ReturnUrl { get; set; }
+
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    [SupplyParameterFromQuery(Name = "configured")]
+    public string? Configured { get; set; }
+
+    private bool _isAuthenticated;
+
+    private string NormalizedReturnUrl =>
+        string.IsNullOrWhiteSpace(ReturnUrl) || !ReturnUrl.StartsWith('/')
+            ? "/"
+            : ReturnUrl;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        _isAuthenticated = authState.User.Identity?.IsAuthenticated ?? false;
+    }
+}

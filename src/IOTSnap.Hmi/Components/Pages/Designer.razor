@@ -1,0 +1,1547 @@
+@page "/designer"
+@attribute [Authorize(Roles = HmiRoles.Admin)]
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject NavigationManager NavigationManager
+@using System.Text
+@using System.Text.Json
+@using IOTSnap.Hmi.Features.Designer
+
+<PageTitle>Designer</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">Designer</div>
+        <h2>Screen Configuration</h2>
+    </div>
+    <p>Create, publish, and inspect screen definitions. Built to be API/MCP compatible.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_message))
+{
+    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">@_message</div>
+}
+
+<section class="panel-card">
+    <div class="panel-label">Create Screen</div>
+    <p>Start with a simple layout and a starter tag to create a publishable screen quickly.</p>
+    <div class="hmi-form-grid hmi-form-grid-4">
+        <label>
+            <span>Name</span>
+            <input @bind="_createName" maxlength="128" />
+        </label>
+        <label>
+            <span>Slug</span>
+            <input @bind="_createSlug" maxlength="64" />
+        </label>
+        <label>
+            <span>Width</span>
+            <input type="number" min="320" step="1" @bind="_createWidth" />
+        </label>
+        <label>
+            <span>Height</span>
+            <input type="number" min="240" step="1" @bind="_createHeight" />
+        </label>
+    </div>
+
+    <div class="hmi-form-grid hmi-form-grid-3">
+        <label>
+            <span>Starter Tag (optional)</span>
+            <select @bind="_selectedNodeId">
+                <option value="">None</option>
+                @foreach (var tag in _tags)
+                {
+                    <option value="@tag.NodeId">@tag.DisplayName (@tag.NodeId)</option>
+                }
+            </select>
+        </label>
+        <label>
+            <span>Widget Type</span>
+            <select @bind="_selectedWidgetType">
+                @foreach (var widgetType in _widgetTypes)
+                {
+                    <option value="@widgetType">@widgetType</option>
+                }
+            </select>
+        </label>
+        <label>
+            <span>Binding Property</span>
+            <select @bind="_selectedBindingProperty">
+                @foreach (var bindingProperty in _bindingProperties)
+                {
+                    <option value="@bindingProperty">@bindingProperty</option>
+                }
+            </select>
+        </label>
+    </div>
+    <p class="setting-value">Bind tags to HMI properties such as Text, Color, Image, Action, or list-based values.</p>
+
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="CreateScreenAsync">Create</button>
+        <button class="hmi-ghost-button" @onclick="RefreshAsync">Refresh</button>
+        <button class="hmi-ghost-button" @onclick="ExportCurrentDesignAsync">Export Package</button>
+        <label class="hmi-file-picker">
+            <span>Import Package</span>
+            <InputFile OnChange="OnPackageFileSelectedAsync" accept=".hmi,.json,application/json" />
+        </label>
+    </div>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Widget Editing</div>
+    <p>Switch to edit mode to select a widget and tune its properties from a docked inspector at the bottom of the screen.</p>
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="ToggleEditMode">@(_isEditMode ? "Exit Edit Mode" : "Enter Edit Mode")</button>
+        @if (_isEditMode && _selectedEditorWidget is not null)
+        {
+            <button class="hmi-ghost-button" @onclick="SaveWidgetEditsAsync">Save Edits</button>
+        }
+    </div>
+
+    @if (_isEditMode)
+    {
+        <div class="widget-canvas-list">
+            @foreach (var widget in _editorWidgets)
+            {
+                <button type="button" class="widget-canvas-card @(widget.Key == _selectedEditorWidget?.Key ? "widget-canvas-card-active" : string.Empty)" @onclick="() => SelectEditorWidget(widget.Key)">
+                    <strong>@widget.Title</strong>
+                    <span>@widget.WidgetType · @widget.X,@widget.Y · @widget.Width×@widget.Height</span>
+                </button>
+            }
+        </div>
+    }
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">CSV Tag Import</div>
+    <p>Paste CSV with headers like DisplayName, NodeId, Area, DataType, SamplingIntervalMs, IsWritable.</p>
+    <div class="inline-action-row">
+        <button class="hmi-ghost-button" @onclick="LoadSampleCsvTemplate">Load Sample CSV Template</button>
+        <label class="hmi-file-picker">
+            <span>Upload CSV</span>
+            <InputFile OnChange="OnCsvFileSelectedAsync" accept=".csv,text/csv" />
+        </label>
+    </div>
+    <label class="inline-field">
+        <span>CSV Content</span>
+        <textarea class="hmi-textarea" rows="8" @bind="_csvContent"></textarea>
+    </label>
+    <div class="inline-action-row">
+        <label class="inline-checkbox">
+            <input type="checkbox" @bind="_csvPersist" />
+            <span>Persist to node mappings</span>
+        </label>
+        <button class="hmi-primary-button" @onclick="ImportCsvAsync">Run Import</button>
+    </div>
+
+    @if (_csvResult is not null)
+    {
+        <div class="setting-value">Imported: @_csvResult.Imported, Updated: @_csvResult.Updated, Preview: @_csvResult.PreviewCount, Rejected: @_csvResult.RejectedCount</div>
+        @if (_csvResult.Diagnostics.Count > 0)
+        {
+            <ul class="diag-list">
+                @foreach (var diag in _csvResult.Diagnostics)
+                {
+                    <li class="diag-item @(diag.Severity.Equals("error", StringComparison.OrdinalIgnoreCase) ? "diag-item-error" : "diag-item-warn")">
+                        <strong>@diag.Code</strong>: @diag.Message
+                        @if (diag.Line.HasValue)
+                        {
+                            <span>(line @diag.Line.Value)</span>
+                        }
+                    </li>
+                }
+            </ul>
+        }
+    }
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Agent Draft Pipeline</div>
+    <p>Generate a draft from a prompt or sketch, review it, then apply it safely with optional publishing.</p>
+    <div class="hmi-form-grid hmi-form-grid-4">
+        <label>
+            <span>Name</span>
+            <input @bind="_draftName" maxlength="128" />
+        </label>
+        <label>
+            <span>Slug</span>
+            <input @bind="_draftSlug" maxlength="64" />
+        </label>
+        <label>
+            <span>Width</span>
+            <input type="number" min="320" step="1" @bind="_draftWidth" />
+        </label>
+        <label>
+            <span>Height</span>
+            <input type="number" min="240" step="1" @bind="_draftHeight" />
+        </label>
+    </div>
+
+    <label class="inline-field">
+        <span>Prompt</span>
+        <input @bind="_draftPrompt" />
+    </label>
+
+    <label class="inline-field">
+        <span>Sketch JSON (optional)</span>
+        <textarea class="hmi-textarea" rows="8" value="@_sketchJson" @oninput="OnSketchJsonInput"></textarea>
+    </label>
+    @if (!string.IsNullOrWhiteSpace(_sketchJson))
+    {
+        <div class="sketch-status @(_isSketchJsonValid ? "sketch-status-ok" : "sketch-status-error")">
+            @(_isSketchJsonValid ? "Sketch JSON valid." : _sketchValidationMessage)
+        </div>
+    }
+
+    <div class="inline-action-row">
+        <button class="hmi-ghost-button" @onclick="LoadSampleSketchTemplate">Load Sample Sketch Template</button>
+        <label class="hmi-file-picker">
+            <span>Upload Sketch JSON</span>
+            <InputFile OnChange="OnSketchFileSelectedAsync" accept=".json,application/json" />
+        </label>
+    </div>
+
+    <div class="inline-action-row">
+        <label class="inline-checkbox">
+            <input type="checkbox" @bind="_allowOverwrite" />
+            <span>Allow overwrite on apply</span>
+        </label>
+        <label class="inline-checkbox">
+            <input type="checkbox" @bind="_publishOnApply" />
+            <span>Publish on apply</span>
+        </label>
+    </div>
+
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="GenerateDraftAsync">Generate Draft</button>
+        <button class="hmi-ghost-button" @onclick="GenerateFromSketchAsync">Generate From Sketch</button>
+        <button class="hmi-ghost-button" @onclick="PreviewDraftAsync">Preview Draft</button>
+        <button class="hmi-primary-button" @onclick="ApplyDraftSafeAsync">Apply Draft Safe</button>
+        @if (_draft is not null)
+        {
+            <button class="hmi-ghost-button" @onclick="DownloadDraftJsonAsync">Download Draft JSON</button>
+        }
+        @if (_rollbackDraft is not null)
+        {
+            <button class="hmi-ghost-button" @onclick="RollbackLastApplyAsync">Rollback Last Apply</button>
+        }
+    </div>
+
+    @if (_draftMetadata is not null)
+    {
+        <div class="setting-value">DraftHash: @_draftMetadata.DraftHash</div>
+        <div class="setting-value">ApplyToken: @_draftMetadata.ApplyToken</div>
+        <div class="setting-value">WidgetCount: @_draftMetadata.WidgetCount</div>
+    }
+    else if (_draft is not null)
+    {
+        <div class="setting-value">Draft is ready for preview or safe application.</div>
+    }
+
+    @if (_previewResult is not null)
+    {
+        <div class="setting-value">CanApply: @(_previewResult.CanApply ? "Yes" : "No")</div>
+    }
+
+    @if (_draftDiagnostics.Count > 0)
+    {
+        <ul class="diag-list">
+            @foreach (var diag in _draftDiagnostics)
+            {
+                <li class="diag-item @(diag.Severity.Equals("error", StringComparison.OrdinalIgnoreCase) ? "diag-item-error" : "diag-item-warn")">
+                    <strong>@diag.Code</strong>: @diag.Message
+                    @if (diag.Line.HasValue)
+                    {
+                        <span>(line @diag.Line.Value)</span>
+                    }
+                </li>
+            }
+        </ul>
+    }
+
+    @if (_draft is not null)
+    {
+        <table class="hmi-table">
+            <thead>
+                <tr>
+                    <th>Widget</th>
+                    <th>Type</th>
+                    <th>Position</th>
+                    <th>Bindings</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var widget in _draft.Widgets)
+                {
+                    <tr>
+                        <td>@widget.Title</td>
+                        <td>@widget.WidgetType</td>
+                        <td>@widget.X,@widget.Y @widget.Width x @widget.Height</td>
+                        <td>@string.Join(" • ", widget.Bindings.Select(x => FormatBindingSummary(x.BindingRole, x.SourceKey)))</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Existing Screens</div>
+    <p>Publish a screen to make it available to the runtime renderer and operator view.</p>
+    <table class="hmi-table">
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Slug</th>
+                <th>Widgets</th>
+                <th>Published</th>
+                <th>Updated</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @if (_screens.Count == 0)
+            {
+                <tr>
+                    <td colspan="6">No screens defined.</td>
+                </tr>
+            }
+            else
+            {
+                @foreach (var screen in _screens)
+                {
+                    <tr>
+                        <td>@screen.Name</td>
+                        <td>@screen.Slug</td>
+                        <td>@screen.WidgetCount</td>
+                        <td>@(screen.IsPublished ? "Yes" : "No")</td>
+                        <td>@screen.UpdatedUtc.ToString("u")</td>
+                        <td>
+                            <div class="table-action-stack">
+                                <button class="hmi-ghost-button" @onclick="() => LoadScreenDetailsAsync(screen.Slug)">Inspect</button>
+                                <button class="hmi-primary-button" @onclick="() => PublishAsync(screen.Id)">Publish</button>
+                                @if (screen.IsPublished)
+                                {
+                                    <button class="hmi-ghost-button" @onclick="() => OpenRuntimeAsync(screen.Slug)">Open Runtime</button>
+                                }
+                                <button class="hmi-ghost-button" @onclick="() => DeleteAsync(screen.Id)">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                }
+            }
+        </tbody>
+    </table>
+</section>
+
+@if (_isEditMode && _selectedEditorWidget is not null)
+{
+    <div class="property-editor-dock">
+        <section class="panel-card property-editor-card">
+            <div class="panel-label">Property Editor</div>
+            <p>Edit the selected widget as if you were tuning an HMI object in a live editor.</p>
+            <div class="hmi-form-grid hmi-form-grid-4">
+                <label>
+                    <span>Title</span>
+                    <input @bind="_selectedEditorWidget.Title" />
+                </label>
+                <label>
+                    <span>Type</span>
+                    <select @bind="_selectedEditorWidget.WidgetType">
+                        @foreach (var widgetType in _widgetTypes)
+                        {
+                            <option value="@widgetType">@widgetType</option>
+                        }
+                    </select>
+                </label>
+                <label>
+                    <span>X</span>
+                    <input type="number" @bind="_selectedEditorWidget.X" />
+                </label>
+                <label>
+                    <span>Y</span>
+                    <input type="number" @bind="_selectedEditorWidget.Y" />
+                </label>
+            </div>
+            <div class="hmi-form-grid hmi-form-grid-4">
+                <label>
+                    <span>Width</span>
+                    <input type="number" @bind="_selectedEditorWidget.Width" />
+                </label>
+                <label>
+                    <span>Height</span>
+                    <input type="number" @bind="_selectedEditorWidget.Height" />
+                </label>
+                <label>
+                    <span>Z</span>
+                    <input type="number" @bind="_selectedEditorWidget.ZIndex" />
+                </label>
+                <label>
+                    <span>Property JSON</span>
+                    <input @bind="_selectedEditorWidget.PropertiesJson" />
+                </label>
+            </div>
+
+            <div class="binding-editor-list">
+                <div class="inline-action-row">
+                    <strong>Bindings</strong>
+                    <button class="hmi-ghost-button" type="button" @onclick="AddBindingToSelectedWidget">Add Binding</button>
+                </div>
+                @foreach (var binding in _selectedEditorWidget.Bindings)
+                {
+                    <div class="binding-editor-row">
+                        <label>
+                            <span>Role</span>
+                            <select @bind="binding.BindingRole">
+                                <option value="Text">Text</option>
+                                <option value="TextList">TextList</option>
+                                <option value="Image">Image</option>
+                                <option value="ImageList">ImageList</option>
+                                <option value="Color">Color</option>
+                                <option value="Action">Action</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span>Source</span>
+                            <input @bind="binding.SourceKey" />
+                        </label>
+                        <label>
+                            <span>Min Role</span>
+                            <select @bind="binding.MinRole">
+                                <option value="Viewer">Viewer</option>
+                                <option value="Operator">Operator</option>
+                                <option value="Admin">Admin</option>
+                            </select>
+                        </label>
+                        <label class="inline-checkbox">
+                            <input type="checkbox" @bind="binding.WriteRequiresConfirm" />
+                            <span>Confirm write</span>
+                        </label>
+                    </div>
+                }
+            </div>
+        </section>
+    </div>
+}
+
+@if (_selectedScreen is not null)
+{
+    <section class="panel-card">
+        <div class="panel-label">Screen Detail: @_selectedScreen.Name (@_selectedScreen.Slug)</div>
+        <table class="hmi-table">
+            <thead>
+                <tr>
+                    <th>Widget</th>
+                    <th>Type</th>
+                    <th>Position</th>
+                    <th>Bindings</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var widget in _selectedScreen.Widgets)
+                {
+                    <tr>
+                        <td>@widget.Title</td>
+                        <td>@widget.WidgetType</td>
+                        <td>@widget.X,@widget.Y @widget.Width x @widget.Height</td>
+                        <td>
+                            @foreach (var binding in widget.Bindings)
+                            {
+                                <div>@FormatBindingSummary(binding.BindingRole, binding.SourceKey) <span class="binding-role-caption">(@binding.MinRole)</span></div>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </section>
+}
+
+@code {
+    private string? _message;
+    private bool _messageIsError;
+
+    private string _createName = "";
+    private string _createSlug = "";
+    private int _createWidth = 1366;
+    private int _createHeight = 768;
+    private string _selectedNodeId = string.Empty;
+    private string _selectedWidgetType = "Numeric";
+    private string _selectedBindingProperty = "Text";
+    private IReadOnlyList<string> _bindingProperties = ["Text", "TextList", "Image", "ImageList", "Color", "Action"];
+    private string _csvContent = string.Empty;
+    private bool _csvPersist;
+    private CsvImportResponseDto? _csvResult;
+
+    private string _draftName = "AI Draft";
+    private string _draftSlug = "ai-draft";
+    private int _draftWidth = 1366;
+    private int _draftHeight = 768;
+    private string _draftPrompt = string.Empty;
+    private string _sketchJson = string.Empty;
+    private bool _isSketchJsonValid = true;
+    private string _sketchValidationMessage = string.Empty;
+    private bool _allowOverwrite;
+    private bool _publishOnApply;
+    private DraftScreenDto? _draft;
+    private DraftMetadataDto? _draftMetadata;
+    private DraftPreviewResponseDto? _previewResult;
+    private List<ApiDiagnosticDto> _draftDiagnostics = new();
+    private DraftScreenDto? _rollbackDraft;
+    private bool _rollbackWasPublished;
+
+    private bool _isEditMode;
+    private WidgetEditorItem? _selectedEditorWidget;
+    private List<WidgetEditorItem> _editorWidgets = new();
+
+    private IReadOnlyList<string> _widgetTypes = ["Numeric", "CommandButton", "TrendChart"];
+    private IReadOnlyList<TagCatalogItemDto> _tags = Array.Empty<TagCatalogItemDto>();
+    private IReadOnlyList<ScreenSummaryDto> _screens = Array.Empty<ScreenSummaryDto>();
+    private ScreenDetailDto? _selectedScreen;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshAsync();
+    }
+
+    private async Task RefreshAsync()
+    {
+        await Task.WhenAll(LoadScreensAsync(), LoadTagCatalogAsync(), LoadCapabilitiesAsync());
+    }
+
+    private async Task LoadCapabilitiesAsync()
+    {
+        try
+        {
+            var capabilities = await Http.GetFromJsonAsync<CapabilitiesDto>("/api/hmi/agent/capabilities");
+            if (capabilities is not null && capabilities.SupportedWidgetTypes.Count > 0)
+            {
+                _widgetTypes = capabilities.SupportedWidgetTypes;
+                if (!_widgetTypes.Contains(_selectedWidgetType, StringComparer.OrdinalIgnoreCase))
+                {
+                    _selectedWidgetType = _widgetTypes[0];
+                }
+            }
+        }
+        catch
+        {
+            // Keep local defaults if capabilities endpoint is unavailable.
+        }
+    }
+
+    private async Task LoadTagCatalogAsync()
+    {
+        _tags = await Http.GetFromJsonAsync<List<TagCatalogItemDto>>("/api/hmi/agent/tag-catalog")
+            ?? new List<TagCatalogItemDto>();
+    }
+
+    private async Task ExportCurrentDesignAsync()
+    {
+        var package = BuildPackageFromCurrentSelection();
+        var archiveBytes = HmiProjectPackageSerializer.CreateArchive(package);
+        await using var stream = new MemoryStream(archiveBytes);
+        using var streamRef = new DotNetStreamReference(stream);
+        await JS.InvokeVoidAsync("hmiDownloadFile", $"{package.Screen.Slug ?? "design"}.hmi", streamRef);
+        _message = "HMI package exported.";
+        _messageIsError = false;
+    }
+
+    private async Task OnPackageFileSelectedAsync(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        await using var stream = file.OpenReadStream(8 * 1024 * 1024);
+        using var memory = new MemoryStream();
+        await stream.CopyToAsync(memory);
+        var package = TryLoadPackage(memory.ToArray());
+        if (package is null)
+        {
+            _message = "The selected file is not a valid HMI package.";
+            _messageIsError = true;
+            return;
+        }
+
+        _createName = package.Screen.Name;
+        _createSlug = package.Screen.Slug;
+        _createWidth = package.Screen.Width;
+        _createHeight = package.Screen.Height;
+        _draftName = package.Screen.Name;
+        _draftSlug = package.Screen.Slug;
+        _draftWidth = package.Screen.Width;
+        _draftHeight = package.Screen.Height;
+        _draft = new DraftScreenDto(
+            package.Screen.Name,
+            package.Screen.Slug,
+            package.Screen.Width,
+            package.Screen.Height,
+            string.Empty,
+            string.Empty,
+            package.Screen.Widgets.Select(ToDraftWidgetDtoFromPackage).ToList());
+        _selectedScreen = null;
+        _message = "HMI package imported. Review and apply it from the draft pipeline.";
+        _messageIsError = false;
+    }
+
+    private static HmiProjectPackage? TryLoadPackage(byte[] packageBytes)
+    {
+        try
+        {
+            var json = Encoding.UTF8.GetString(packageBytes);
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                var package = HmiProjectPackageSerializer.Deserialize(json);
+                if (package is not null)
+                {
+                    return package;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // Fall back to archive-based packaging.
+        }
+
+        try
+        {
+            return HmiProjectPackageSerializer.ReadArchive(packageBytes);
+        }
+        catch (InvalidDataException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+    }
+
+    private async Task LoadScreensAsync()
+    {
+        _screens = await Http.GetFromJsonAsync<List<ScreenSummaryDto>>("/api/hmi/designer/screens")
+            ?? new List<ScreenSummaryDto>();
+    }
+
+    private async Task LoadScreenDetailsAsync(string slug)
+    {
+        _selectedScreen = await Http.GetFromJsonAsync<ScreenDetailDto>($"/api/hmi/designer/screens/{slug}");
+        SyncEditorWidgetsFromCurrentSelection();
+    }
+
+    private async Task ImportCsvAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/import-tags-csv", new CsvImportRequestDto(_csvContent, _csvPersist, null));
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _csvResult = await response.Content.ReadFromJsonAsync<CsvImportResponseDto>();
+        _message = _csvPersist ? "CSV import completed." : "CSV preview completed.";
+        _messageIsError = false;
+        await RefreshAsync();
+    }
+
+    private void LoadSampleCsvTemplate()
+    {
+        _csvContent =
+            "DisplayName,NodeId,Area,DataType,SamplingIntervalMs,IsWritable\n"
+            + "Tank Level,ns=2;s=Plant.Tank.Level,Process,double,1000,false\n"
+            + "Line Speed,ns=2;s=Plant.Line.Speed,Process,double,500,false\n"
+            + "Start Command,ns=2;s=Plant.Line.Start,Commands,bool,250,true\n";
+    }
+
+    private async Task OnCsvFileSelectedAsync(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        await using var stream = file.OpenReadStream(2 * 1024 * 1024);
+        using var reader = new StreamReader(stream);
+        _csvContent = await reader.ReadToEndAsync();
+    }
+
+    private async Task GenerateDraftAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        var sketch = ParseSketchJsonOrNull();
+        if (_messageIsError)
+        {
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/draft-screen", new DraftScreenRequestDto(
+            _draftName,
+            _draftSlug,
+            _draftWidth,
+            _draftHeight,
+            _draftPrompt,
+            sketch?.Notes,
+            sketch,
+            null));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _draft = await response.Content.ReadFromJsonAsync<DraftScreenDto>();
+        _draftMetadata = null;
+        _previewResult = null;
+        _draftDiagnostics.Clear();
+        SyncEditorWidgetsFromCurrentSelection();
+        _message = "Draft generated.";
+    }
+
+    private async Task GenerateFromSketchAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        var sketch = ParseSketchJsonOrNull();
+        if (sketch is null)
+        {
+            _message = "Sketch JSON is required for sketch synthesis.";
+            _messageIsError = true;
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/sketch-intake", new SketchIntakeRequestDto(
+            _draftName,
+            _draftSlug,
+            _draftWidth,
+            _draftHeight,
+            _draftPrompt,
+            sketch,
+            24));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        var result = await response.Content.ReadFromJsonAsync<SketchIntakeResponseDto>();
+        if (result is null)
+        {
+            _message = "No sketch response payload returned.";
+            _messageIsError = true;
+            return;
+        }
+
+        _draft = result.Draft;
+        _draftMetadata = result.Metadata;
+        _draftDiagnostics = result.Diagnostics.ToList();
+        _previewResult = null;
+        SyncEditorWidgetsFromCurrentSelection();
+        _message = "Sketch draft generated.";
+    }
+
+        private void LoadSampleSketchTemplate()
+        {
+            _sketchJson = """
+{
+    "sourceWidth": 1200,
+    "sourceHeight": 800,
+    "notes": "Simple two-row operator layout",
+    "elements": [
+        { "id": "pv-1", "kind": "numeric", "label": "Tank Level", "x": 80, "y": 80, "width": 300, "height": 140 },
+        { "id": "pv-2", "kind": "numeric", "label": "Line Speed", "x": 420, "y": 80, "width": 300, "height": 140 },
+        { "id": "cmd-1", "kind": "button", "label": "Start Line", "x": 760, "y": 80, "width": 220, "height": 140 },
+        { "id": "trend-1", "kind": "trend", "label": "Flow Trend", "x": 80, "y": 260, "width": 900, "height": 260 }
+    ]
+}
+""";
+        ValidateSketchJson();
+        }
+
+    private async Task OnSketchFileSelectedAsync(InputFileChangeEventArgs e)
+        {
+        var file = e.File;
+        await using var stream = file.OpenReadStream(2 * 1024 * 1024);
+        using var reader = new StreamReader(stream);
+        _sketchJson = await reader.ReadToEndAsync();
+        ValidateSketchJson();
+    }
+
+    private void OnSketchJsonInput(ChangeEventArgs e)
+    {
+        _sketchJson = e.Value?.ToString() ?? string.Empty;
+        ValidateSketchJson();
+    }
+
+    private void ValidateSketchJson()
+    {
+        _isSketchJsonValid = true;
+        _sketchValidationMessage = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(_sketchJson))
+        {
+            return;
+        }
+
+        try
+        {
+            var sketch = JsonSerializer.Deserialize<SketchLayoutInputDto>(_sketchJson, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            if (sketch is null)
+            {
+                _isSketchJsonValid = false;
+                _sketchValidationMessage = "Sketch JSON parsed as null.";
+            }
+        }
+        catch (Exception ex)
+        {
+            _isSketchJsonValid = false;
+            _sketchValidationMessage = $"Invalid sketch JSON: {ex.Message}";
+        }
+        }
+
+    private async Task PreviewDraftAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        if (_draft is null)
+        {
+            _message = "Generate a draft first.";
+            _messageIsError = true;
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/draft-preview", new DraftPreviewRequestDto(_draft, _allowOverwrite));
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        var preview = await response.Content.ReadFromJsonAsync<DraftPreviewResponseDto>();
+        if (preview is null)
+        {
+            _message = "No preview payload returned.";
+            _messageIsError = true;
+            return;
+        }
+
+        _previewResult = preview;
+        _draft = preview.Draft;
+        _draftMetadata = preview.Metadata;
+        _draftDiagnostics = preview.Diagnostics.ToList();
+        SyncEditorWidgetsFromCurrentSelection();
+        _message = "Draft preview ready.";
+    }
+
+    private async Task ApplyDraftSafeAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        if (_draft is null)
+        {
+            _message = "Generate and preview a draft first.";
+            _messageIsError = true;
+            return;
+        }
+
+        var expectedHash = _draftMetadata?.DraftHash;
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/apply-draft-safe", new ApplyDraftRequestDto(
+            _draft,
+            expectedHash,
+            _allowOverwrite,
+            _publishOnApply));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        var apply = await response.Content.ReadFromJsonAsync<ApplyDraftResponseDto>();
+        if (apply?.Rollback?.Draft is not null)
+        {
+            _rollbackDraft = apply.Rollback.Draft;
+            _rollbackWasPublished = apply.Rollback.WasPublished;
+        }
+
+        _message = "Draft applied successfully.";
+        _messageIsError = false;
+        await RefreshAsync();
+    }
+
+    private async Task RollbackLastApplyAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        if (_rollbackDraft is null)
+        {
+            _message = "No rollback snapshot available.";
+            _messageIsError = true;
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/agent/apply-draft-safe", new ApplyDraftRequestDto(
+            _rollbackDraft,
+            null,
+            true,
+            _rollbackWasPublished));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _message = "Rollback applied.";
+        _messageIsError = false;
+        await RefreshAsync();
+    }
+
+    private SketchLayoutInputDto? ParseSketchJsonOrNull()
+    {
+        if (string.IsNullOrWhiteSpace(_sketchJson))
+        {
+            return null;
+        }
+
+        ValidateSketchJson();
+        if (!_isSketchJsonValid)
+        {
+            _message = _sketchValidationMessage;
+            _messageIsError = true;
+            return null;
+        }
+
+        try
+        {
+            var sketch = JsonSerializer.Deserialize<SketchLayoutInputDto>(_sketchJson, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            if (sketch is null)
+            {
+                _message = "Sketch JSON parsed as null.";
+                _messageIsError = true;
+                return null;
+            }
+
+            return sketch;
+        }
+        catch (Exception ex)
+        {
+            _message = $"Invalid sketch JSON: {ex.Message}";
+            _messageIsError = true;
+            return null;
+        }
+    }
+
+    private async Task DownloadDraftJsonAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        if (_draft is null)
+        {
+            _message = "No draft available to download.";
+            _messageIsError = true;
+            return;
+        }
+
+        var json = JsonSerializer.Serialize(_draft, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            WriteIndented = true
+        });
+
+        await using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
+        using var streamRef = new DotNetStreamReference(stream);
+        await JS.InvokeVoidAsync("hmiDownloadFile", $"{_draft.Slug}.draft.json", streamRef);
+        _message = "Draft JSON downloaded.";
+    }
+
+    private async Task CreateScreenAsync()
+    {
+        _message = null;
+        _messageIsError = false;
+
+        var bindings = new List<WidgetBindingDto>();
+        if (!string.IsNullOrWhiteSpace(_selectedNodeId))
+        {
+            bindings.Add(new WidgetBindingDto(_selectedBindingProperty, "OpcTag", _selectedNodeId, false, HmiRoles.Viewer));
+        }
+
+        var payload = new CreateScreenRequest(
+            _createName,
+            _createSlug,
+            _createWidth,
+            _createHeight,
+            [new WidgetUpsertDto("starter-1", _selectedWidgetType, "Starter Widget", 40, 40, 320, 160, 1, "{}", bindings)]);
+
+        var response = await Http.PostAsJsonAsync("/api/hmi/designer/screens", payload);
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _message = "Screen created.";
+        await RefreshAsync();
+    }
+
+    private void ToggleEditMode()
+    {
+        _isEditMode = !_isEditMode;
+        SyncEditorWidgetsFromCurrentSelection();
+    }
+
+    private void SyncEditorWidgetsFromCurrentSelection()
+    {
+        var widgets = new List<WidgetEditorItem>();
+
+        if (_draft is not null)
+        {
+            widgets.AddRange(_draft.Widgets.Select(ToEditorWidget));
+        }
+        else if (_selectedScreen is not null)
+        {
+            widgets.AddRange(_selectedScreen.Widgets.Select(ToEditorWidget));
+        }
+
+        _editorWidgets = widgets;
+
+        if (_selectedEditorWidget is not null)
+        {
+            var existing = _editorWidgets.FirstOrDefault(x => x.Key == _selectedEditorWidget.Key);
+            if (existing is not null)
+            {
+                _selectedEditorWidget = existing;
+                return;
+            }
+        }
+
+        _selectedEditorWidget = _editorWidgets.FirstOrDefault();
+    }
+
+    private void SelectEditorWidget(string key)
+    {
+        _selectedEditorWidget = _editorWidgets.FirstOrDefault(x => x.Key == key);
+    }
+
+    private void AddBindingToSelectedWidget()
+    {
+        if (_selectedEditorWidget is null)
+        {
+            return;
+        }
+
+        _selectedEditorWidget.Bindings.Add(new WidgetBindingEditorItem("Text", "OpcTag", string.Empty, false, HmiRoles.Viewer));
+    }
+
+    private async Task SaveWidgetEditsAsync()
+    {
+        if (_selectedEditorWidget is null)
+        {
+            return;
+        }
+
+        if (_selectedScreen is not null)
+        {
+            var widgets = _editorWidgets.Select(ToWidgetUpsertDto).ToList();
+            var payload = new UpdateScreenRequest(
+                _selectedScreen.Name,
+                _selectedScreen.Slug,
+                _selectedScreen.Width,
+                _selectedScreen.Height,
+                widgets);
+
+            var response = await Http.PutAsJsonAsync($"/api/hmi/designer/screens/{_selectedScreen.Id}", payload);
+            if (!response.IsSuccessStatusCode)
+            {
+                _message = await response.Content.ReadAsStringAsync();
+                _messageIsError = true;
+                return;
+            }
+
+            await LoadScreenDetailsAsync(_selectedScreen.Slug);
+            _message = "Widget properties saved.";
+            _messageIsError = false;
+            return;
+        }
+
+        if (_draft is not null)
+        {
+            _draft = new DraftScreenDto(
+                _draft.Name,
+                _draft.Slug,
+                _draft.Width,
+                _draft.Height,
+                _draft.Prompt,
+                _draft.SketchNotes,
+                _editorWidgets.Select(ToDraftWidgetDto).ToList());
+            SyncEditorWidgetsFromCurrentSelection();
+            _message = "Draft widget properties updated.";
+            _messageIsError = false;
+        }
+    }
+
+    private async Task PublishAsync(int screenId)
+    {
+        var response = await Http.PostAsync($"/api/hmi/designer/screens/{screenId}/publish", null);
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _message = "Screen published. Open the runtime view to inspect it.";
+        _messageIsError = false;
+        await RefreshAsync();
+    }
+
+    private void OpenRuntimeAsync(string slug)
+    {
+        NavigationManager.NavigateTo($"/runtime/{slug}");
+    }
+
+    private async Task DeleteAsync(int screenId)
+    {
+        var response = await Http.DeleteAsync($"/api/hmi/designer/screens/{screenId}");
+        if (!response.IsSuccessStatusCode)
+        {
+            _message = await response.Content.ReadAsStringAsync();
+            _messageIsError = true;
+            return;
+        }
+
+        _message = "Screen deleted.";
+        _messageIsError = false;
+        _selectedScreen = null;
+        await RefreshAsync();
+    }
+
+    private static string FormatBindingSummary(string? bindingRole, string? sourceKey)
+    {
+        var roleLabel = NormalizeBindingRole(bindingRole);
+        return string.IsNullOrWhiteSpace(sourceKey)
+            ? roleLabel
+            : $"{roleLabel} → {sourceKey}";
+    }
+
+    private static string NormalizeBindingRole(string? bindingRole)
+    {
+        if (string.IsNullOrWhiteSpace(bindingRole))
+        {
+            return "Text";
+        }
+
+        return bindingRole.Trim() switch
+        {
+            "PrimaryValue" or "Value" or "Text" => "Text",
+            "TextList" => "Text list",
+            "Image" => "Image",
+            "ImageList" => "Image list",
+            "Color" => "Color",
+            "Action" => "Action",
+            _ => bindingRole.Trim()
+        };
+    }
+
+    private sealed record CreateScreenRequest(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        IReadOnlyList<WidgetUpsertDto> Widgets);
+
+    private sealed record UpdateScreenRequest(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        IReadOnlyList<WidgetUpsertDto> Widgets);
+
+    private sealed record WidgetUpsertDto(
+        string Key,
+        string WidgetType,
+        string Title,
+        int X,
+        int Y,
+        int Width,
+        int Height,
+        int ZIndex,
+        string PropertiesJson,
+        IReadOnlyList<WidgetBindingDto> Bindings);
+
+    private sealed record WidgetBindingDto(
+        string BindingRole,
+        string SourceType,
+        string SourceKey,
+        bool WriteRequiresConfirm,
+        string MinRole);
+
+    private sealed class WidgetEditorItem
+    {
+        public WidgetEditorItem(string key, string widgetType, string title, int x, int y, int width, int height, int zIndex, string propertiesJson, IReadOnlyList<WidgetBindingEditorItem> bindings)
+        {
+            Key = key;
+            WidgetType = widgetType;
+            Title = title;
+            X = x;
+            Y = y;
+            Width = width;
+            Height = height;
+            ZIndex = zIndex;
+            PropertiesJson = propertiesJson;
+            Bindings = bindings.ToList();
+        }
+
+        public string Key { get; set; }
+        public string WidgetType { get; set; }
+        public string Title { get; set; }
+        public int X { get; set; }
+        public int Y { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
+        public int ZIndex { get; set; }
+        public string PropertiesJson { get; set; }
+        public List<WidgetBindingEditorItem> Bindings { get; set; }
+    }
+
+    private sealed class WidgetBindingEditorItem
+    {
+        public WidgetBindingEditorItem(string bindingRole, string sourceType, string sourceKey, bool writeRequiresConfirm, string minRole)
+        {
+            BindingRole = bindingRole;
+            SourceType = sourceType;
+            SourceKey = sourceKey;
+            WriteRequiresConfirm = writeRequiresConfirm;
+            MinRole = minRole;
+        }
+
+        public string BindingRole { get; set; }
+        public string SourceType { get; set; }
+        public string SourceKey { get; set; }
+        public bool WriteRequiresConfirm { get; set; }
+        public string MinRole { get; set; }
+    }
+
+    private sealed record ScreenSummaryDto(
+        int Id,
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        bool IsPublished,
+        DateTimeOffset? PublishedUtc,
+        DateTimeOffset UpdatedUtc,
+        int WidgetCount);
+
+    private sealed record ScreenDetailDto(
+        int Id,
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        bool IsPublished,
+        DateTimeOffset? PublishedUtc,
+        DateTimeOffset UpdatedUtc,
+        IReadOnlyList<WidgetDetailDto> Widgets);
+
+    private sealed record WidgetDetailDto(
+        int Id,
+        string Key,
+        string WidgetType,
+        string Title,
+        int X,
+        int Y,
+        int Width,
+        int Height,
+        int ZIndex,
+        string PropertiesJson,
+        IReadOnlyList<WidgetBindingDto> Bindings);
+
+    private sealed record TagCatalogItemDto(
+        int Id,
+        string DisplayName,
+        string NodeId,
+        string Area,
+        string DataType,
+        bool IsWritable,
+        int SamplingIntervalMs);
+
+    private sealed record CsvImportRequestDto(
+        string CsvContent,
+        bool Persist,
+        int? ConnectionProfileId);
+
+    private sealed record CsvImportResponseDto(
+        int Imported,
+        int Updated,
+        int PreviewCount,
+        int RejectedCount,
+        IReadOnlyList<ApiDiagnosticDto> Diagnostics);
+
+    private sealed record ApiDiagnosticDto(
+        string Severity,
+        string Code,
+        string Message,
+        int? Line,
+        int? Column);
+
+    private sealed record SketchLayoutInputDto(
+        int SourceWidth,
+        int SourceHeight,
+        string? Notes,
+        IReadOnlyList<SketchElementDto> Elements);
+
+    private sealed record SketchElementDto(
+        string Id,
+        string Kind,
+        string Label,
+        double X,
+        double Y,
+        double Width,
+        double Height);
+
+    private sealed record DraftScreenRequestDto(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        string? Prompt,
+        string? SketchNotes,
+        SketchLayoutInputDto? Sketch,
+        IReadOnlyList<DraftWidgetDto>? Widgets);
+
+    private sealed record SketchIntakeRequestDto(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        string? Prompt,
+        SketchLayoutInputDto? Sketch,
+        int? MaxTags);
+
+    private sealed record DraftPreviewRequestDto(
+        DraftScreenDto Draft,
+        bool AllowOverwrite);
+
+    private sealed record ApplyDraftRequestDto(
+        DraftScreenDto Draft,
+        string? ExpectedDraftHash,
+        bool AllowOverwrite,
+        bool Publish);
+
+    private sealed record SketchIntakeResponseDto(
+        DraftScreenDto Draft,
+        DraftMetadataDto Metadata,
+        IReadOnlyList<ApiDiagnosticDto> Diagnostics);
+
+    private sealed record DraftPreviewResponseDto(
+        DraftScreenDto Draft,
+        DraftMetadataDto Metadata,
+        bool CanApply,
+        IReadOnlyList<ApiDiagnosticDto> Diagnostics);
+
+    private sealed record DraftMetadataDto(
+        string DraftHash,
+        string ApplyToken,
+        int WidgetCount,
+        DateTimeOffset GeneratedUtc);
+
+    private sealed record ApplyDraftResponseDto(
+        int Id,
+        string Slug,
+        bool IsPublished,
+        DraftMetadataDto Metadata,
+        RollbackDto? Rollback,
+        IReadOnlyList<ApiDiagnosticDto>? Diagnostics);
+
+    private sealed record RollbackDto(
+        int ScreenId,
+        string Slug,
+        bool WasPublished,
+        DateTimeOffset CapturedUtc,
+        DraftScreenDto Draft);
+
+    private sealed record DraftScreenDto(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        string Prompt,
+        string SketchNotes,
+        IReadOnlyList<DraftWidgetDto> Widgets);
+
+    private sealed record DraftWidgetDto(
+        string Key,
+        string WidgetType,
+        string Title,
+        int X,
+        int Y,
+        int Width,
+        int Height,
+        int ZIndex,
+        string PropertiesJson,
+        IReadOnlyList<DraftBindingDto> Bindings);
+
+    private sealed record DraftBindingDto(
+        string BindingRole,
+        string SourceType,
+        string SourceKey,
+        bool WriteRequiresConfirm,
+        string MinRole);
+
+    private HmiProjectPackage BuildPackageFromCurrentSelection()
+    {
+        var screen = _draft is not null
+            ? _draft
+            : _selectedScreen is not null
+                ? new DraftScreenDto(
+                    _selectedScreen.Name,
+                    _selectedScreen.Slug,
+                    _selectedScreen.Width,
+                    _selectedScreen.Height,
+                    string.Empty,
+                    string.Empty,
+                    _selectedScreen.Widgets.Select(ToDraftWidgetDtoFromScreen).ToList())
+                : new DraftScreenDto(_createName, _createSlug, _createWidth, _createHeight, string.Empty, string.Empty, Array.Empty<DraftWidgetDto>());
+
+        var packageScreen = new HmiProjectPackageScreen(
+            screen.Name,
+            screen.Slug,
+            screen.Width,
+            screen.Height,
+            _selectedScreen?.IsPublished ?? false,
+            screen.Widgets.Select(ToPackageWidget));
+
+        return HmiProjectPackage.Create(packageScreen);
+    }
+
+    private HmiProjectPackageWidget ToPackageWidget(DraftWidgetDto widget)
+    {
+        return new HmiProjectPackageWidget(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new HmiProjectPackageBinding(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)));
+    }
+
+    private DraftWidgetDto ToDraftWidgetDtoFromPackage(HmiProjectPackageWidget widget)
+    {
+        return new DraftWidgetDto(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new DraftBindingDto(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private DraftWidgetDto ToDraftWidgetDtoFromScreen(WidgetDetailDto widget)
+    {
+        return new DraftWidgetDto(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new DraftBindingDto(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private WidgetEditorItem ToEditorWidget(DraftWidgetDto widget)
+    {
+        return new WidgetEditorItem(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new WidgetBindingEditorItem(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private WidgetEditorItem ToEditorWidget(WidgetDetailDto widget)
+    {
+        return new WidgetEditorItem(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new WidgetBindingEditorItem(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private WidgetUpsertDto ToWidgetUpsertDto(WidgetEditorItem widget)
+    {
+        return new WidgetUpsertDto(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new WidgetBindingDto(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private DraftWidgetDto ToDraftWidgetDto(WidgetEditorItem widget)
+    {
+        return new DraftWidgetDto(
+            widget.Key,
+            widget.WidgetType,
+            widget.Title,
+            widget.X,
+            widget.Y,
+            widget.Width,
+            widget.Height,
+            widget.ZIndex,
+            widget.PropertiesJson,
+            widget.Bindings.Select(x => new DraftBindingDto(x.BindingRole, x.SourceType, x.SourceKey, x.WriteRequiresConfirm, x.MinRole)).ToList());
+    }
+
+    private sealed record CapabilitiesDto(
+        string Version,
+        IReadOnlyList<string> Routes,
+        IReadOnlyList<string> SupportedWidgetTypes,
+        IReadOnlyList<string> SupportedBindingSourceTypes,
+        string Notes);
+}

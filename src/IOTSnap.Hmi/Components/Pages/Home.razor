@@ -1,0 +1,88 @@
+@page "/"
+@attribute [Authorize]
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+@inject IOpcUaRuntime OpcUaRuntime
+
+<PageTitle>IOTSnap HMI</PageTitle>
+
+<section class="hero-card">
+    <div>
+        <div class="hmi-kicker">Machine Overview</div>
+        <h2>Operator-ready HMI starter shell</h2>
+        <p>
+            This experience is now wired for local auth, local settings, and a live OPC UA runtime path that can be demonstrated immediately.
+            The seeded demo profile gives you a realistic starting point for connectivity, alarms, and screen publishing.
+        </p>
+    </div>
+    <div class="status-card @(_runtimeStatus.IsConnected ? "status-good" : "status-warn")">
+        <div class="status-label">Runtime</div>
+        <div class="status-value">@(_runtimeStatus.IsConnected ? "Connected" : "Not Connected")</div>
+        <div class="status-detail">@_runtimeStatus.Detail</div>
+        <div class="button-row">
+            <a class="hmi-primary-button" href="/comms">Open Comms</a>
+            <a class="hmi-ghost-button" href="/runtime/main">Open Runtime</a>
+        </div>
+    </div>
+</section>
+
+<section class="dashboard-grid">
+    <article class="panel-card">
+        <div class="panel-label">Configured Users</div>
+        <div class="panel-metric">@_userCount</div>
+        <p>Role-based access is stored locally in SQLite for a fully self-hosted setup.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">OPC UA Profiles</div>
+        <div class="panel-metric">@_profileCount</div>
+        <p>Profiles, security mode, and node mappings can be managed directly in the GUI.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Mapped Nodes</div>
+        <div class="panel-metric">@_nodeCount</div>
+        <p>Starter data is seeded so the comms page has something meaningful to inspect.</p>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">Active Profile</div>
+        <div class="panel-metric panel-metric-sm">@_runtimeStatus.ActiveProfileName</div>
+        <p>@_runtimeStatus.EndpointUrl</p>
+    </article>
+</section>
+
+<section class="stack-grid">
+    <article class="panel-card">
+        <div class="panel-label">Demo Flow</div>
+        <ul class="diag-list">
+            <li class="diag-item">Review the live connection state in the communications view.</li>
+            <li class="diag-item">Inspect seeded mappings and alarm handling before connecting to a real PLC.</li>
+            <li class="diag-item">Open the runtime screen to see the published dashboard update with live values.</li>
+        </ul>
+    </article>
+
+    <article class="panel-card">
+        <div class="panel-label">What is Ready</div>
+        <ul class="diag-list">
+            <li class="diag-item">Local authentication and setup flow.</li>
+            <li class="diag-item">Database-backed runtime and screen publishing.</li>
+            <li class="diag-item">Health and readiness endpoints for deployment checks.</li>
+        </ul>
+    </article>
+</section>
+
+@code {
+    private OpcUaRuntimeStatus _runtimeStatus = new();
+    private int _userCount;
+    private int _profileCount;
+    private int _nodeCount;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        _userCount = await db.LocalUsers.CountAsync();
+        _profileCount = await db.OpcUaConnectionProfiles.CountAsync();
+        _nodeCount = await db.OpcUaNodeMappings.CountAsync();
+        _runtimeStatus = await OpcUaRuntime.GetStatusAsync();
+    }
+}

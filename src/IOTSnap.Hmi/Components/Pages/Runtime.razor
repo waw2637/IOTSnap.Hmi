@@ -1,0 +1,328 @@
+@page "/runtime/{Slug}"
+@attribute [Authorize]
+@inject HttpClient Http
+@implements IAsyncDisposable
+
+<PageTitle>Runtime Screen</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">Runtime</div>
+        <h2>@_screenName</h2>
+    </div>
+    <p>Live operator view that reflects the published screen payload and current tag state.</p>
+</section>
+
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <div class="notice-banner notice-banner-error">@_error</div>
+}
+
+<section class="runtime-overview">
+    <article class="panel-card">
+        <div class="panel-label">Screen Status</div>
+        <div class="panel-metric panel-metric-sm">@_screenName</div>
+        <p>Rendered from the published payload and refreshed automatically.</p>
+    </article>
+    <article class="panel-card">
+        <div class="panel-label">Widget Count</div>
+        <div class="panel-metric">@_widgets.Count</div>
+        <p>Each card below reflects the latest live snapshot for its primary value.</p>
+    </article>
+    <article class="panel-card">
+        <div class="panel-label">Latest Focus</div>
+        <div class="panel-metric panel-metric-sm">@GetSummaryValue()</div>
+        <p>@GetSummaryStatus()</p>
+    </article>
+</section>
+
+@if (_widgets.Count == 0)
+{
+    <section class="panel-card">
+        <p>No published widgets found for this screen.</p>
+    </section>
+}
+else
+{
+    <section class="runtime-grid">
+        @foreach (var widget in _widgets)
+        {
+            var primaryBinding = GetPreferredBinding(widget);
+            var propertyRole = GetPropertyRole(primaryBinding);
+            var tag = primaryBinding?.TagSnapshot;
+            var cardTone = tag?.HasAlarm == true ? "runtime-card-alert" : tag?.IsStale == true ? "runtime-card-warn" : "runtime-card-good";
+            var valueText = GetWidgetValueText(primaryBinding, tag);
+
+            <article class="runtime-card @cardTone">
+                <div class="runtime-card-header">
+                    <div>
+                        <div class="panel-label">@widget.WidgetType</div>
+                        <h3>@widget.Title</h3>
+                    </div>
+                    <span class="status-pill">@(tag?.HasAlarm == true ? "Alarm" : tag?.IsStale == true ? "Stale" : "Live")</span>
+                </div>
+                <div class="binding-role-chip">@GetBindingLabel(primaryBinding)</div>
+                <div class="runtime-card-value">@valueText</div>
+                @if (propertyRole == "Color")
+                {
+                    <div class="property-preview property-preview-color" style="background:@GetColorValue(tag)"></div>
+                }
+                else if (propertyRole == "Action")
+                {
+                    <div class="property-preview property-preview-action">Action target ready for write</div>
+                }
+                else if (propertyRole == "Image" || propertyRole == "ImageList")
+                {
+                    <div class="property-preview property-preview-image">🖼️ @GetBindingHint(primaryBinding)</div>
+                }
+                else
+                {
+                    <div class="property-preview property-preview-text">@GetBindingHint(primaryBinding)</div>
+                }
+                <div class="runtime-card-meta">
+                    <span>Binding: @(primaryBinding?.SourceKey ?? "n/a")</span>
+                    <span>Position: @widget.X,@widget.Y</span>
+                </div>
+                <div class="runtime-card-meta">
+                    <span>Status: @(tag?.StatusCode ?? "pending")</span>
+                    <span>Updated: @(tag?.UpdatedUtc.ToLocalTime().ToString("HH:mm:ss") ?? "—")</span>
+                </div>
+            </article>
+        }
+    </section>
+}
+
+@code {
+    private readonly PeriodicTimer _refreshTimer = new(TimeSpan.FromSeconds(2));
+    private readonly CancellationTokenSource _refreshCts = new();
+    private bool _refreshStarted;
+
+    [Parameter]
+    public string Slug { get; set; } = string.Empty;
+
+    private string _screenName = "Runtime Screen";
+    private string? _error;
+    private IReadOnlyList<RuntimeWidgetDto> _widgets = Array.Empty<RuntimeWidgetDto>();
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await LoadPayloadAsync();
+
+        if (!_refreshStarted)
+        {
+            _refreshStarted = true;
+            _ = Task.Run(RefreshLoopAsync);
+        }
+    }
+
+    private async Task LoadPayloadAsync()
+    {
+        _error = null;
+        _widgets = Array.Empty<RuntimeWidgetDto>();
+
+        try
+        {
+            var payload = await Http.GetFromJsonAsync<RuntimePayloadDto>($"/api/hmi/runtime/screens/{Slug}");
+            if (payload is null)
+            {
+                _error = "No payload returned for this screen.";
+                return;
+            }
+
+            _screenName = payload.Name;
+            _widgets = payload.Widgets;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Failed to load runtime payload: {ex.Message}";
+        }
+    }
+
+    private async Task RefreshLoopAsync()
+    {
+        try
+        {
+            while (await _refreshTimer.WaitForNextTickAsync(_refreshCts.Token))
+            {
+                await InvokeAsync(async () =>
+                {
+                    await LoadPayloadAsync();
+                    StateHasChanged();
+                });
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Page disposed.
+        }
+    }
+
+    private string GetSummaryValue()
+    {
+        var primaryWidget = _widgets.FirstOrDefault();
+        var primaryBinding = GetPreferredBinding(primaryWidget);
+        return string.IsNullOrWhiteSpace(primaryBinding?.TagSnapshot?.ValueText)
+            ? "Waiting for data"
+            : primaryBinding.TagSnapshot.ValueText;
+    }
+
+    private string GetSummaryStatus()
+    {
+        var primaryWidget = _widgets.FirstOrDefault();
+        var primaryBinding = GetPreferredBinding(primaryWidget);
+        var tag = primaryBinding?.TagSnapshot;
+
+        if (tag?.HasAlarm == true)
+        {
+            return tag.AlarmText;
+        }
+
+        if (tag?.IsStale == true)
+        {
+            return "Value is stale";
+        }
+
+        return tag is null ? "No live snapshot yet" : "Snapshot is healthy";
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _refreshCts.Cancel();
+        _refreshTimer.Dispose();
+        _refreshCts.Dispose();
+        return ValueTask.CompletedTask;
+    }
+
+    private static RuntimeBindingDto? GetPreferredBinding(RuntimeWidgetDto? widget)
+    {
+        if (widget is null)
+        {
+            return null;
+        }
+
+        return widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "PrimaryValue", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "Text", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "Value", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "Color", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "Image", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, "Action", StringComparison.OrdinalIgnoreCase))
+            ?? widget.Bindings.FirstOrDefault();
+    }
+
+    private static string GetPropertyRole(RuntimeBindingDto? binding)
+    {
+        if (binding is null)
+        {
+            return "Text";
+        }
+
+        return binding.BindingRole.Trim() switch
+        {
+            "PrimaryValue" or "Value" or "Text" => "Text",
+            "TextList" => "TextList",
+            "Image" => "Image",
+            "ImageList" => "ImageList",
+            "Color" => "Color",
+            "Action" => "Action",
+            _ => "Text"
+        };
+    }
+
+    private static string GetBindingLabel(RuntimeBindingDto? binding)
+    {
+        return GetPropertyRole(binding) switch
+        {
+            "TextList" => "Text list",
+            "ImageList" => "Image list",
+            "Color" => "Color",
+            "Image" => "Image",
+            "Action" => "Action",
+            _ => "Text"
+        };
+    }
+
+    private static string GetBindingHint(RuntimeBindingDto? binding)
+    {
+        return GetPropertyRole(binding) switch
+        {
+            "TextList" => "List-based text property",
+            "ImageList" => "List-based image property",
+            "Color" => "State color property",
+            "Image" => "Image property",
+            "Action" => "Command property",
+            _ => "Value property"
+        };
+    }
+
+    private static string GetWidgetValueText(RuntimeBindingDto? binding, RuntimeTagSnapshotDto? tag)
+    {
+        var valueText = tag?.ValueText;
+        if (string.IsNullOrWhiteSpace(valueText))
+        {
+            return "No value";
+        }
+
+        return GetPropertyRole(binding) switch
+        {
+            "TextList" => string.Join(" • ", valueText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+            _ => valueText
+        };
+    }
+
+    private static string GetColorValue(RuntimeTagSnapshotDto? tag)
+    {
+        if (tag is null || string.IsNullOrWhiteSpace(tag.ValueText))
+        {
+            return "#1f4fd7";
+        }
+
+        var value = tag.ValueText.Trim();
+        return value.ToLowerInvariant() switch
+        {
+            "red" => "#d14343",
+            "green" => "#2f9e44",
+            "yellow" or "amber" => "#d48a1b",
+            "blue" => "#1f4fd7",
+            "orange" => "#d97706",
+            _ when value.StartsWith('#') => value,
+            _ => "#1f4fd7"
+        };
+    }
+
+    private sealed record RuntimePayloadDto(
+        string Name,
+        string Slug,
+        int Width,
+        int Height,
+        DateTimeOffset? PublishedUtc,
+        IReadOnlyList<RuntimeWidgetDto> Widgets);
+
+    private sealed record RuntimeWidgetDto(
+        string Key,
+        string WidgetType,
+        string Title,
+        int X,
+        int Y,
+        int Width,
+        int Height,
+        int ZIndex,
+        string PropertiesJson,
+        IReadOnlyList<RuntimeBindingDto> Bindings);
+
+    private sealed record RuntimeBindingDto(
+        string BindingRole,
+        string SourceType,
+        string SourceKey,
+        bool WriteRequiresConfirm,
+        string MinRole,
+        RuntimeTagSnapshotDto? TagSnapshot);
+
+    private sealed record RuntimeTagSnapshotDto(
+        string NodeId,
+        string? ValueText,
+        string? StatusCode,
+        bool IsStale,
+        bool HasAlarm,
+        string AlarmText,
+        DateTimeOffset UpdatedUtc);
+}
