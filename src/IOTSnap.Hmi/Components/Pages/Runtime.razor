@@ -2,6 +2,8 @@
 @attribute [Authorize]
 @inject HttpClient Http
 @inject IJSRuntime JS
+@inject NavigationManager NavigationManager
+@inject AuthenticationStateProvider AuthenticationStateProvider
 @implements IAsyncDisposable
 @using System.Globalization
 @using IOTSnap.Hmi.Features.Designer
@@ -19,6 +21,10 @@
 @if (!string.IsNullOrWhiteSpace(_error))
 {
     <div class="notice-banner notice-banner-error">@_error</div>
+}
+@if (!string.IsNullOrWhiteSpace(_commandStatus))
+{
+    <div class="notice-banner">@_commandStatus</div>
 }
 
 <section class="runtime-overview">
@@ -38,6 +44,55 @@
         <p>@GetSummaryStatus()</p>
     </article>
 </section>
+
+@if (_activeAlarms.Count > 0 || _recentAlarms.Count > 0)
+{
+    <section class="panel-card runtime-alarms-panel">
+        <div class="panel-label">Alarm Status</div>
+        @if (_activeAlarms.Count > 0)
+        {
+            <div class="runtime-alarms-section">
+                <div class="runtime-alarms-section-title">Active alarms</div>
+                <div class="runtime-alarms-list">
+                    @foreach (var alarm in _activeAlarms)
+                    {
+                        <div class="runtime-alarm-item">
+                            <div class="runtime-alarm-heading">
+                                <strong>@alarm.DisplayName</strong>
+                                <span class="alarm-badge @RuntimeAlarmSummary.GetBadgeClass(alarm.IsActive, alarm.IsAcknowledged)">@RuntimeAlarmSummary.GetBadgeText(alarm.IsActive, alarm.IsAcknowledged)</span>
+                            </div>
+                            <div class="runtime-alarm-meta">Severity @alarm.Severity • @alarm.Area • @alarm.AlarmText</div>
+                            <div class="runtime-alarm-meta">Raised @alarm.LastRaisedUtc.ToLocalTime().ToString("HH:mm:ss")</div>
+                            @if (!alarm.IsAcknowledged && _canControl)
+                            {
+                                <button class="hmi-primary-button touch-input-button" @onclick="() => AcknowledgeAlarmAsync(alarm.NodeId)">Acknowledge</button>
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+        @if (_recentAlarms.Count > 0)
+        {
+            <div class="runtime-alarms-section">
+                <div class="runtime-alarms-section-title">Recent history</div>
+                <div class="runtime-alarms-list">
+                    @foreach (var alarm in _recentAlarms)
+                    {
+                        <div class="runtime-alarm-item runtime-alarm-item-muted">
+                            <div class="runtime-alarm-heading">
+                                <strong>@alarm.DisplayName</strong>
+                                <span class="alarm-badge @RuntimeAlarmSummary.GetBadgeClass(alarm.IsActive, alarm.IsAcknowledged)">@RuntimeAlarmSummary.GetBadgeText(alarm.IsActive, alarm.IsAcknowledged)</span>
+                            </div>
+                            <div class="runtime-alarm-meta">Severity @alarm.Severity • @alarm.Area • @alarm.AlarmText</div>
+                            <div class="runtime-alarm-meta">Raised @alarm.LastRaisedUtc.ToLocalTime().ToString("HH:mm:ss")</div>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    </section>
+}
 
 @if (_widgets.Count == 0)
 {
@@ -82,12 +137,36 @@ else
                 {
                     <div class="property-preview property-preview-text">@GetBindingHint(primaryBinding)</div>
                 }
-                @if (HasNumericInput(widget, primaryBinding))
+                @if (HasNumericInput(widget, primaryBinding) && _canControl)
                 {
                     <div class="runtime-input-shell">
                         <label class="touch-input-label">@GetInputLabel(widget, primaryBinding)</label>
-                        <input class="touch-input" type="number" inputmode="decimal" step="@GetInputStep(widget, primaryBinding)" min="@GetInputMin(widget, primaryBinding)" max="@GetInputMax(widget, primaryBinding)" value="@GetPendingInputValue(widget, primaryBinding)" @oninput="e => SetPendingInputValue(widget.Key, primaryBinding?.SourceKey ?? string.Empty, e.Value?.ToString() ?? string.Empty)" />
+                        <input class="touch-input" type="@GetInputType(widget, primaryBinding)" inputmode="@GetInputMode(widget, primaryBinding)" step="@GetInputStep(widget, primaryBinding)" min="@GetInputMin(widget, primaryBinding)" max="@GetInputMax(widget, primaryBinding)" value="@GetPendingInputValue(widget, primaryBinding)" @oninput="e => SetPendingInputValue(widget.Key, primaryBinding?.SourceKey ?? string.Empty, e.Value?.ToString() ?? string.Empty)" @onfocus="() => OpenKeypad(widget, primaryBinding)" @onclick="() => OpenKeypad(widget, primaryBinding)" />
                         <button class="hmi-primary-button touch-input-button" @onclick="() => WriteWidgetValueAsync(widget, primaryBinding)">Write</button>
+                    </div>
+                }
+                @if (HasNavigationTarget(widget))
+                {
+                    <button class="hmi-primary-button touch-input-button" @onclick="() => NavigateToTargetScreenAsync(widget)">Open Screen</button>
+                }
+                else if (IsCommandWidget(widget, primaryBinding) && _canControl)
+                {
+                    <button class="hmi-primary-button touch-input-button" @onclick="() => ExecuteCommandAsync(widget, primaryBinding)">Execute Command</button>
+                }
+                @if (ShouldShowTrend(widget, primaryBinding))
+                {
+                    <div class="runtime-trend-shell">
+                        <div class="runtime-trend-header">
+                            <div class="runtime-trend-label">Value trend</div>
+                            <div class="runtime-trend-controls">
+                                @foreach (var window in new[] { "5m", "15m", "1h" })
+                                {
+                                    <button class="runtime-trend-window @GetTrendWindowClass(window)" @onclick="() => SetTrendWindow(window)">@window</button>
+                                }
+                                <button class="runtime-trend-window" @onclick="() => OpenTrendView(widget, primaryBinding)">Full view</button>
+                            </div>
+                        </div>
+                        @((MarkupString)GetTrendMarkup(primaryBinding))
                     </div>
                 }
                 <div class="runtime-card-meta">
@@ -103,21 +182,93 @@ else
     </section>
 }
 
+@if (_showInputKeyboard)
+{
+    <div class="input-keyboard-overlay" role="dialog" aria-label="Touch keypad">
+        <div class="input-keyboard-panel">
+            <div class="input-keyboard-header">
+                <div>
+                    <div class="panel-label">Editing</div>
+                    <h4>@_activeInputLabel</h4>
+                </div>
+                <button class="hmi-secondary-button" @onclick="CloseInputKeyboard">Close</button>
+            </div>
+            <div class="input-keyboard-value">@GetActiveInputValuePreview()</div>
+            <div class="input-keyboard-grid">
+                @foreach (var button in GetActiveKeypadButtons())
+                {
+                    <button class="input-keyboard-button" @onclick="() => AppendToActiveValue(button)">@button</button>
+                }
+                <button class="input-keyboard-button input-keyboard-button-action" @onclick="ClearActiveValue">Clear</button>
+                <button class="input-keyboard-button input-keyboard-button-action" @onclick="CloseInputKeyboard">Done</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_showTrendOverlay)
+{
+    <div class="trend-overlay" role="dialog" aria-label="Trend detail">
+        <div class="trend-overlay-panel">
+            <div class="trend-overlay-header">
+                <div>
+                    <div class="panel-label">Trending</div>
+                    <h4>@_activeTrendTitle</h4>
+                </div>
+                <button class="hmi-secondary-button" @onclick="CloseTrendView">Close</button>
+            </div>
+            <div class="runtime-trend-header">
+                <div class="runtime-trend-label">@_activeTrendLabel</div>
+                <div class="runtime-trend-controls">
+                    @foreach (var window in new[] { "5m", "15m", "1h" })
+                    {
+                        <button class="runtime-trend-window @GetTrendWindowClass(window)" @onclick="() => SetTrendWindow(window)">@window</button>
+                    }
+                </div>
+            </div>
+            @((MarkupString)GetTrendMarkup(_activeTrendBinding))
+            <div class="runtime-card-meta">
+                <span>Binding: @(_activeTrendBinding?.SourceKey ?? "n/a")</span>
+                <span>Window: @_activeTrendWindow</span>
+            </div>
+        </div>
+    </div>
+}
+
 @code {
     private readonly PeriodicTimer _refreshTimer = new(TimeSpan.FromSeconds(2));
     private readonly CancellationTokenSource _refreshCts = new();
     private bool _refreshStarted;
+    private bool _canControl;
 
     [Parameter]
     public string Slug { get; set; } = string.Empty;
 
     private string _screenName = "Runtime Screen";
     private string? _error;
+    private string? _commandStatus;
     private IReadOnlyList<RuntimeWidgetDto> _widgets = Array.Empty<RuntimeWidgetDto>();
+    private IReadOnlyList<string> _screenSlugs = Array.Empty<string>();
+    private IReadOnlyList<RuntimeAlarmDto> _alarms = Array.Empty<RuntimeAlarmDto>();
+    private IReadOnlyList<RuntimeAlarmDto> _activeAlarms = Array.Empty<RuntimeAlarmDto>();
+    private IReadOnlyList<RuntimeAlarmDto> _recentAlarms = Array.Empty<RuntimeAlarmDto>();
     private readonly Dictionary<string, string> _pendingInputValues = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<decimal>> _trendHistory = new(StringComparer.OrdinalIgnoreCase);
+    private string _activeTrendWindow = "15m";
+    private bool _showInputKeyboard;
+    private bool _showTrendOverlay;
+    private string? _activeInputWidgetKey;
+    private string? _activeInputSourceKey;
+    private string? _activeInputLabel;
+    private string _activeInputMode = "Number";
+    private string _activeTrendTitle = "Trend";
+    private string _activeTrendLabel = "Value trend";
+    private RuntimeBindingDto? _activeTrendBinding;
 
     protected override async Task OnParametersSetAsync()
     {
+        var authentication = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+        _canControl = RuntimeOperatorPermissions.CanControl(authentication.User.FindFirst(System.Security.Claims.ClaimTypes.Role)?.Value);
         await LoadPayloadAsync();
 
         if (!_refreshStarted)
@@ -143,6 +294,23 @@ else
 
             _screenName = payload.Name;
             _widgets = payload.Widgets;
+
+            var screensPayload = await Http.GetFromJsonAsync<IReadOnlyList<RuntimeScreenSummaryDto>>("/api/hmi/runtime/screens");
+            var screenSlugs = screensPayload?.Select(x => x.Slug).Where(x => !string.IsNullOrWhiteSpace(x)).ToList() ?? new List<string>();
+            _screenSlugs = screenSlugs;
+
+            foreach (var widget in _widgets)
+            {
+                var binding = GetPreferredBinding(widget);
+                TrackTrendValue(binding, binding?.TagSnapshot?.ValueText);
+            }
+
+            await LoadPersistedTrendHistoryAsync();
+
+            var alarmPayload = await Http.GetFromJsonAsync<IReadOnlyList<RuntimeAlarmDto>>("/api/hmi/runtime/alarms");
+            _alarms = alarmPayload ?? Array.Empty<RuntimeAlarmDto>();
+            _activeAlarms = _alarms.Where(x => x.IsActive || !x.IsAcknowledged).Take(6).ToList();
+            _recentAlarms = _alarms.Where(x => !x.IsActive && x.IsAcknowledged).Take(4).ToList();
         }
         catch (Exception ex)
         {
@@ -205,6 +373,40 @@ else
         return ValueTask.CompletedTask;
     }
 
+    private async Task AcknowledgeAlarmAsync(string nodeId)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId))
+        {
+            return;
+        }
+
+        var binding = _widgets
+            .SelectMany(x => x.Bindings.Select(binding => new { Widget = x, Binding = binding }))
+            .FirstOrDefault(x => string.Equals(x.Binding.SourceKey, nodeId, StringComparison.OrdinalIgnoreCase));
+        if (binding is null)
+        {
+            _error = "This alarm is not available on the current published screen.";
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync($"/api/hmi/runtime/alarms/{Uri.EscapeDataString(nodeId)}/acknowledge", new
+        {
+            screenSlug = Slug,
+            widgetKey = binding.Widget.Key,
+            bindingRole = binding.Binding.BindingRole
+        });
+        if (!response.IsSuccessStatusCode)
+        {
+            _error = await response.Content.ReadAsStringAsync();
+            return;
+        }
+
+        var command = await response.Content.ReadFromJsonAsync<RuntimeCommandResultDto>();
+        _commandStatus = command is null ? "Command request completed." : $"Command {command.CommandId}: {command.Status}";
+        _error = null;
+        await LoadPayloadAsync();
+    }
+
     private async Task WriteWidgetValueAsync(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
     {
         if (binding is null || string.IsNullOrWhiteSpace(binding.SourceKey))
@@ -235,7 +437,13 @@ else
             }
         }
 
-        var response = await Http.PostAsJsonAsync($"/api/hmi/runtime/write/{Uri.EscapeDataString(binding.SourceKey)}", new { value = rawValue });
+        var response = await Http.PostAsJsonAsync($"/api/hmi/runtime/write/{Uri.EscapeDataString(binding.SourceKey)}", new
+        {
+            value = rawValue,
+            screenSlug = Slug,
+            widgetKey = widget.Key,
+            bindingRole = binding.BindingRole
+        });
         if (!response.IsSuccessStatusCode)
         {
             _error = await response.Content.ReadAsStringAsync();
@@ -245,6 +453,101 @@ else
         _pendingInputValues[key] = rawValue;
         _error = null;
         await LoadPayloadAsync();
+    }
+
+    private async Task ExecuteCommandAsync(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        if (binding is null)
+        {
+            return;
+        }
+
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        var idempotencyKey = Guid.NewGuid().ToString("N");
+        var response = await SendCommandAsync(widget, binding, properties.CommandValue, idempotencyKey, confirmed: false);
+        if (response.StatusCode == System.Net.HttpStatusCode.Accepted)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("confirm", $"Confirm {widget.Title} with value {properties.CommandValue}?");
+            if (!confirmed)
+            {
+                _error = "Command confirmation was cancelled.";
+                return;
+            }
+
+            response = await SendCommandAsync(widget, binding, properties.CommandValue, idempotencyKey, confirmed: true);
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _error = await response.Content.ReadAsStringAsync();
+            return;
+        }
+
+        _error = null;
+        await LoadPayloadAsync();
+    }
+
+    private Task<HttpResponseMessage> SendCommandAsync(RuntimeWidgetDto widget, RuntimeBindingDto binding, string value, string idempotencyKey, bool confirmed)
+        => Http.PostAsJsonAsync($"/api/hmi/runtime/write/{Uri.EscapeDataString(binding.SourceKey)}", new
+        {
+            value,
+            screenSlug = Slug,
+            widgetKey = widget.Key,
+            bindingRole = binding.BindingRole,
+            idempotencyKey,
+            confirmed
+        });
+
+    private void TrackTrendValue(RuntimeBindingDto? binding, string? valueText)
+    {
+        if (binding is null || string.IsNullOrWhiteSpace(binding.SourceKey) || !decimal.TryParse(valueText, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedValue))
+        {
+            return;
+        }
+
+        if (!_trendHistory.TryGetValue(binding.SourceKey, out var history))
+        {
+            history = new List<decimal>();
+            _trendHistory[binding.SourceKey] = history;
+        }
+
+        history.Add(parsedValue);
+        if (history.Count > 8)
+        {
+            history.RemoveAt(0);
+        }
+    }
+
+    private async Task LoadPersistedTrendHistoryAsync()
+    {
+        var nodeIds = _widgets
+            .Select(GetPreferredBinding)
+            .Where(x => !string.IsNullOrWhiteSpace(x?.SourceKey))
+            .Select(x => x!.SourceKey)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (var nodeId in nodeIds)
+        {
+            try
+            {
+                var samples = await Http.GetFromJsonAsync<IReadOnlyList<RuntimeTrendSampleDto>>(
+                    $"/api/hmi/runtime/trends/{Uri.EscapeDataString(nodeId)}?maxPoints=120");
+                var values = samples?
+                    .Select(x => decimal.TryParse(x.ValueText, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) ? value : (decimal?)null)
+                    .Where(x => x is not null)
+                    .Select(x => x!.Value)
+                    .ToList();
+                if (values is { Count: > 0 })
+                {
+                    _trendHistory[nodeId] = values;
+                }
+            }
+            catch (HttpRequestException)
+            {
+                // The live buffer remains available while historian data is temporarily unavailable.
+            }
+        }
     }
 
     private static string GetWidgetValueText(RuntimeBindingDto? binding, RuntimeTagSnapshotDto? tag)
@@ -357,6 +660,8 @@ else
         DateTimeOffset? PublishedUtc,
         IReadOnlyList<RuntimeWidgetDto> Widgets);
 
+    private sealed record RuntimeScreenSummaryDto(string Slug);
+
     private sealed record RuntimeWidgetDto(
         string Key,
         string WidgetType,
@@ -387,6 +692,23 @@ else
         string AlarmText,
         DateTimeOffset UpdatedUtc);
 
+    private sealed record RuntimeTrendSampleDto(string? ValueText, string? StatusCode, DateTimeOffset SampledUtc);
+
+    private sealed record RuntimeCommandResultDto(string CommandId, string Status, string? Message, bool RequiresConfirmation);
+
+    private sealed record RuntimeAlarmDto(
+        string NodeId,
+        string DisplayName,
+        string Area,
+        string StatusCode,
+        string AlarmText,
+        int Severity,
+        bool IsActive,
+        bool IsAcknowledged,
+        DateTimeOffset LastRaisedUtc,
+        DateTimeOffset? AcknowledgedUtc,
+        string? AcknowledgedBy);
+
     private static bool HasNumericInput(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
     {
         if (binding is null)
@@ -394,8 +716,13 @@ else
             return false;
         }
 
-        return GetPropertyRole(binding) is "Text" or "Value" || binding.BindingRole.Equals("Action", StringComparison.OrdinalIgnoreCase);
+        return widget.WidgetType.Equals("Numeric", StringComparison.OrdinalIgnoreCase)
+            && binding.BindingRole.Equals("Action", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsCommandWidget(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+        => widget.WidgetType.Equals("CommandButton", StringComparison.OrdinalIgnoreCase)
+            && binding?.BindingRole.Equals("Action", StringComparison.OrdinalIgnoreCase) == true;
 
     private static string GetInputLabel(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
     {
@@ -423,10 +750,76 @@ else
         return properties.InputMax?.ToString(CultureInfo.InvariantCulture) ?? string.Empty;
     }
 
+    private static string GetInputType(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return properties.InputMode.Equals("Text", StringComparison.OrdinalIgnoreCase) ? "text" : "number";
+    }
+
+    private static string GetInputMode(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return properties.InputMode.Equals("Text", StringComparison.OrdinalIgnoreCase) ? "text" : "decimal";
+    }
+
     private string GetPendingInputValue(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
     {
         var key = GetInputKey(widget, binding);
         return _pendingInputValues.TryGetValue(key, out var pending) ? pending : string.Empty;
+    }
+
+    private static bool ShouldShowTrend(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        return GetPropertyRole(binding) is "Text" or "Value" && !string.IsNullOrWhiteSpace(binding?.SourceKey);
+    }
+
+    private string GetTrendMarkup(RuntimeBindingDto? binding)
+    {
+        if (binding is null || string.IsNullOrWhiteSpace(binding.SourceKey))
+        {
+            return string.Empty;
+        }
+
+        var values = new List<decimal>();
+        if (binding.TagSnapshot is not null && decimal.TryParse(binding.TagSnapshot.ValueText, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedValue))
+        {
+            values.Add(parsedValue);
+        }
+
+        var historyValues = _trendHistory.TryGetValue(binding.SourceKey, out var history) ? history : new List<decimal>();
+        if (historyValues.Count > 0)
+        {
+            values.InsertRange(0, historyValues);
+        }
+
+        if (values.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var sampleCount = _activeTrendWindow switch
+        {
+            "5m" => 6,
+            "1h" => 12,
+            _ => 8
+        };
+
+        if (values.Count > sampleCount)
+        {
+            values = values.TakeLast(sampleCount).ToList();
+        }
+
+        return RuntimeTrendSeries.BuildSvgMarkup(values, 100, 50, 4);
+    }
+
+    private string GetTrendWindowClass(string window)
+    {
+        return string.Equals(window, _activeTrendWindow, StringComparison.OrdinalIgnoreCase) ? "runtime-trend-window-active" : string.Empty;
+    }
+
+    private void SetTrendWindow(string window)
+    {
+        _activeTrendWindow = window;
     }
 
     private void SetPendingInputValue(string widgetKey, string sourceKey, string value)
@@ -434,8 +827,163 @@ else
         _pendingInputValues[$"{widgetKey}:{sourceKey}"] = value;
     }
 
+    private void OpenKeypad(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        if (binding is null)
+        {
+            return;
+        }
+
+        _activeInputWidgetKey = widget.Key;
+        _activeInputSourceKey = binding.SourceKey;
+        _activeInputLabel = GetInputLabel(widget, binding);
+        _activeInputMode = GetInputMode(widget, binding);
+        _showInputKeyboard = true;
+    }
+
+    private void CloseInputKeyboard()
+    {
+        _showInputKeyboard = false;
+        _activeInputWidgetKey = null;
+        _activeInputSourceKey = null;
+        _activeInputLabel = null;
+    }
+
+    private void NavigateToTargetScreenAsync(RuntimeWidgetDto widget)
+    {
+        if (widget is null)
+        {
+            return;
+        }
+
+        var targetSlug = RuntimeScreenNavigation.ResolveTargetScreenSlug(GetWidgetTargetSlug(widget), _screenSlugs);
+        if (string.IsNullOrWhiteSpace(targetSlug))
+        {
+            _error = "No target screen configured for this action.";
+            return;
+        }
+
+        NavigationManager.NavigateTo($"/runtime/{Uri.EscapeDataString(targetSlug)}");
+    }
+
+    private string? GetWidgetTargetSlug(RuntimeWidgetDto widget)
+    {
+        if (string.IsNullOrWhiteSpace(widget.PropertiesJson))
+        {
+            return null;
+        }
+
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        return string.IsNullOrWhiteSpace(properties.TargetScreenSlug)
+            ? null
+            : properties.TargetScreenSlug;
+    }
+
+    private bool HasNavigationTarget(RuntimeWidgetDto widget)
+        => !string.IsNullOrWhiteSpace(GetWidgetTargetSlug(widget));
+
+    private void OpenTrendView(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
+    {
+        if (binding is null)
+        {
+            return;
+        }
+
+        _activeTrendBinding = binding;
+        _activeTrendTitle = string.IsNullOrWhiteSpace(widget.Title) ? widget.WidgetType : widget.Title;
+        _activeTrendLabel = $"{GetBindingLabel(binding)} trend";
+        _showTrendOverlay = true;
+    }
+
+    private void CloseTrendView()
+    {
+        _showTrendOverlay = false;
+        _activeTrendBinding = null;
+        _activeTrendTitle = "Trend";
+        _activeTrendLabel = "Value trend";
+    }
+
+    private string GetActiveInputValuePreview()
+    {
+        if (string.IsNullOrWhiteSpace(_activeInputWidgetKey) || string.IsNullOrWhiteSpace(_activeInputSourceKey))
+        {
+            return "No input selected";
+        }
+
+        var key = GetInputKey(_activeInputWidgetKey, _activeInputSourceKey);
+        return _pendingInputValues.TryGetValue(key, out var pending) && !string.IsNullOrWhiteSpace(pending)
+            ? pending
+            : "0";
+    }
+
+    private IReadOnlyList<string> GetActiveKeypadButtons()
+    {
+        if (_activeInputMode.Equals("text", StringComparison.OrdinalIgnoreCase))
+        {
+            return new[] { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "space", "⌫" };
+        }
+
+        return new[] { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", ".", "±", "⌫" };
+    }
+
+    private void ClearActiveValue()
+    {
+        if (string.IsNullOrWhiteSpace(_activeInputWidgetKey) || string.IsNullOrWhiteSpace(_activeInputSourceKey))
+        {
+            return;
+        }
+
+        var key = GetInputKey(_activeInputWidgetKey, _activeInputSourceKey);
+        _pendingInputValues[key] = string.Empty;
+    }
+
+    private void AppendToActiveValue(string button)
+    {
+        if (string.IsNullOrWhiteSpace(_activeInputWidgetKey) || string.IsNullOrWhiteSpace(_activeInputSourceKey))
+        {
+            return;
+        }
+
+        var key = GetInputKey(_activeInputWidgetKey, _activeInputSourceKey);
+        var existing = _pendingInputValues.TryGetValue(key, out var pending) ? pending : string.Empty;
+
+        switch (button)
+        {
+            case "⌫":
+                existing = existing.Length > 0 ? existing[..^1] : string.Empty;
+                break;
+            case "±":
+                if (decimal.TryParse(existing, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+                {
+                    existing = (-value).ToString(CultureInfo.InvariantCulture);
+                }
+                else if (existing.StartsWith('-'))
+                {
+                    existing = existing[1..];
+                }
+                else
+                {
+                    existing = $"-{existing}";
+                }
+                break;
+            case "space":
+                existing += " ";
+                break;
+            default:
+                existing += button;
+                break;
+        }
+
+        _pendingInputValues[key] = existing;
+    }
+
     private static string GetInputKey(RuntimeWidgetDto widget, RuntimeBindingDto? binding)
     {
         return $"{widget.Key}:{binding?.SourceKey ?? string.Empty}";
+    }
+
+    private static string GetInputKey(string widgetKey, string? sourceKey)
+    {
+        return $"{widgetKey}:{sourceKey ?? string.Empty}";
     }
 }

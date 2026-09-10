@@ -6,6 +6,28 @@ namespace IOTSnap.Hmi.Tests;
 public class HmiPackageRoundTripTests
 {
     [Fact]
+    public void Validate_RejectsUnsupportedVersion()
+    {
+        var package = HmiProjectPackage.Create(new HmiProjectPackageScreen("Main", "main", 800, 600, false, [new HmiProjectPackageWidget("value", "Numeric", "Value", 0, 0, 100, 100, 0, "{}", [])]));
+        var json = HmiProjectPackageSerializer.Serialize(package).Replace("\"version\": \"1.1\"", "\"version\": \"99.0\"");
+
+        Assert.Null(HmiProjectPackageSerializer.Deserialize(json));
+    }
+
+    [Fact]
+    public void Validate_RejectsDuplicateWidgetKeys()
+    {
+        var widgets = new[]
+        {
+            new HmiProjectPackageWidget("value", "Numeric", "Value", 0, 0, 100, 100, 0, "{}", []),
+            new HmiProjectPackageWidget("value", "TrendChart", "Trend", 100, 0, 100, 100, 1, "{}", [])
+        };
+        var package = HmiProjectPackage.Create(new HmiProjectPackageScreen("Main", "main", 800, 600, false, widgets));
+
+        Assert.False(HmiProjectPackageSerializer.Validate(package, out var error));
+        Assert.Contains("unique", error, StringComparison.OrdinalIgnoreCase);
+    }
+    [Fact]
     public void RoundTrip_PreservesScreenIdentityAndBindings()
     {
         var screen = new HmiProjectPackageScreen(

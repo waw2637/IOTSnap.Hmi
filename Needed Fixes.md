@@ -1,47 +1,24 @@
-# IOTSnap HMI v1 TODO
+# IOTSnap HMI v1 Status Tracker
 
-## Completed Foundation
+The authoritative execution order, acceptance criteria, and release gates are in [ROADMAP.md](ROADMAP.md). This file is intentionally short so status does not drift away from the plan.
 
-- [x] First-run setup workflow replaces hardcoded defaults.
-- [x] Live subscribed tag cache and Comms live-value panel.
-- [x] Safe tag write pipeline with role gating and typed conversion.
-- [x] Alarm and stale-data indicators from live quality + freshness.
-- [x] Persisted alarm lifecycle (active/acknowledged/cleared) and acknowledge actions.
+## Completed foundation
 
-## v1 Delivery Plan
+- [x] First-run setup workflow and local roles.
+- [x] OPC UA connection profiles, mapped live tag cache, and Comms live-value panel.
+- [x] Typed OPC UA write pipeline and baseline stale/quality indicators.
+- [x] Persisted alarm state and acknowledgement mechanics.
+- [x] Screen/widget/binding schema, designer CRUD, publish action, and runtime published-payload API.
+- [x] Numeric, command-button, and trend-chart widget contracts.
+- [x] HMI package import/export and agent-assisted draft tooling.
 
-### 1) Designer Backend Contract (In Progress)
+## Current execution order
 
-- [ ] Add screen schema with draft/published state.
-- [ ] Add widget schema for core types: numeric, command button, trend chart.
-- [ ] Add widget binding schema (read and write intent, role requirement).
-- [ ] Add server-side validation for layout and bindings.
-
-### 2) Designer/Runtime APIs
-
-- [ ] Add CRUD endpoints for screens and widgets.
-- [ ] Add publish endpoint to freeze runtime payload.
-- [ ] Add runtime endpoint to fetch published screen payload by slug.
-
-### 3) Initial Runtime Renderer
-
-- [ ] Add renderer page that loads published payload and renders core widget types.
-- [ ] Bind numeric widgets to live OPC UA tag snapshots.
-- [ ] Bind command button widgets to safe write pipeline.
-
-### 4) Trend/Historian Backend (Minimal)
-
-- [ ] Add time-series sample persistence for configured trend tags.
-- [ ] Add trend query endpoint with range and downsampling.
-
-### 5) Operator Audit Trail
-
-- [ ] Persist writes, alarm acknowledges, and publish actions.
-- [ ] Add table endpoint for audit records.
-
-## v1 Exit Criteria
-
-- [ ] One published runtime screen can be rendered from DB payload.
-- [ ] Numeric read + command write + trend chart work end-to-end.
-- [ ] Alarm lifecycle and acknowledgement visible in runtime UX.
-- [ ] Audit records capture operator writes and acknowledgements.
+- [x] HMI-001: Finish and validate the in-progress runtime alarm, navigation, input, and chart slice.
+- [x] HMI-002: Establish representative acceptance fixtures and release contracts. See [FactoryAcceptance.md](docs/FactoryAcceptance.md).
+- [ ] HMI-010 through HMI-013: Close server-side control authorization, command confirmation, audit, and secret-protection gaps.
+- [ ] Release Gate A: Prove the controlled runtime foundation.
+- [ ] HMI-020 through HMI-022: Deliver durable alarm history, persisted trends, and resilient OPC UA behavior.
+- [ ] HMI-030 through HMI-032: Complete the operator, designer, and package workflows.
+- [ ] HMI-040 through HMI-042: Produce operational evidence and qualify the local release.
+- [ ] Release Gate B: Approve the shippable local HMI v1 candidate.

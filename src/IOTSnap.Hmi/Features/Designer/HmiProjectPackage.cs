@@ -114,6 +114,9 @@ public sealed class HmiProjectPackageMetadata
 
 public static class HmiProjectPackageSerializer
 {
+    public const int MaximumArchiveBytes = 5 * 1024 * 1024;
+    public const int MaximumAssetBytes = 1024 * 1024;
+    public const int MaximumWidgetCount = 100;
     private static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
     {
         WriteIndented = true
@@ -126,7 +129,8 @@ public static class HmiProjectPackageSerializer
 
     public static HmiProjectPackage? Deserialize(string json)
     {
-        return JsonSerializer.Deserialize<HmiProjectPackage>(json, Options);
+        var package = JsonSerializer.Deserialize<HmiProjectPackage>(json, Options);
+        return Validate(package, out _) ? package : null;
     }
 
     public static byte[] CreateArchive(HmiProjectPackage package, IReadOnlyDictionary<string, byte[]>? assets = null)
@@ -159,6 +163,7 @@ public static class HmiProjectPackageSerializer
 
     public static HmiProjectPackage? ReadArchive(byte[] archiveBytes)
     {
+        if (archiveBytes.Length > MaximumArchiveBytes) return null;
         using var stream = new MemoryStream(archiveBytes);
         using var archive = new ZipArchive(stream, ZipArchiveMode.Read, true);
         var manifestEntry = archive.GetEntry("manifest.json");
@@ -183,9 +188,23 @@ public static class HmiProjectPackageSerializer
             using var entryStream = entry.Open();
             using var memory = new MemoryStream();
             entryStream.CopyTo(memory);
+            if (memory.Length > MaximumAssetBytes) throw new InvalidDataException("Package asset exceeds the size limit.");
             assets[entry.Name] = memory.ToArray();
         }
 
         return assets;
+    }
+
+    public static bool Validate(HmiProjectPackage? package, out string error)
+    {
+        if (package is null) { error = "Package content is missing."; return false; }
+        if (!string.Equals(package.Format, "iot-snap-hmi-package", StringComparison.Ordinal)) { error = "Unsupported package format."; return false; }
+        if (!string.Equals(package.Version, HmiProjectPackage.FileTypeVersion, StringComparison.Ordinal)) { error = "Unsupported package version."; return false; }
+        if (string.IsNullOrWhiteSpace(package.Screen.Name) || string.IsNullOrWhiteSpace(package.Screen.Slug)) { error = "Package screen name and slug are required."; return false; }
+        if (package.Screen.Width < 320 || package.Screen.Height < 240) { error = "Package screen dimensions are invalid."; return false; }
+        if (package.Screen.Widgets.Count is 0 or > MaximumWidgetCount) { error = "Package widget count is outside the supported limit."; return false; }
+        if (package.Screen.Widgets.GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase).Any(x => string.IsNullOrWhiteSpace(x.Key) || x.Count() > 1)) { error = "Package widget keys must be present and unique."; return false; }
+        error = string.Empty;
+        return true;
     }
 }

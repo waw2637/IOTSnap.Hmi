@@ -1,0 +1,96 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opc-plc-config
+  namespace: workloads
+data:
+  nodes.json: |
+    {
+      "Folder": "Harness",
+      "NodeList": [
+        {
+          "NodeId": "Plant.Line.Start",
+          "Name": "StartCommand",
+          "DataType": "Boolean",
+          "ValueRank": -1,
+          "AccessLevel": "CurrentReadOrWrite",
+          "Description": "Writable start command used by HMI release qualification"
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opc-plc
+  namespace: workloads
+  labels:
+    app.kubernetes.io/name: opc-plc
+    app.kubernetes.io/part-of: iotsnap-hmi-qualification
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: opc-plc
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: opc-plc
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: cp1
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: opc-plc
+          image: mcr.microsoft.com/iotedge/opc-plc:latest
+          imagePullPolicy: Always
+          args: ["--autoaccept", "--pn=50000", "--nodesfile=/app/config/nodes.json"]
+          ports:
+            - name: opc-ua
+              containerPort: 50000
+              hostPort: 50000
+          volumeMounts:
+            - name: opc-plc-config
+              mountPath: /app/config
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: opc-ua
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: opc-ua
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: opc-plc-config
+          configMap:
+            name: opc-plc-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opc-plc
+  namespace: workloads
+spec:
+  selector:
+    app.kubernetes.io/name: opc-plc
+  ports:
+    - name: opc-ua
+      port: 50000
+      targetPort: opc-ua
+  type: ClusterIP

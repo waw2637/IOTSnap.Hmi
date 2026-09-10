@@ -9,6 +9,7 @@ public sealed class OpcUaAlarmSnapshot
     public string StatusCode { get; init; } = string.Empty;
     public string? LastValueText { get; init; }
     public string AlarmText { get; init; } = string.Empty;
+    public int Severity { get; init; }
     public bool IsActive { get; init; }
     public bool IsAcknowledged { get; init; }
     public DateTimeOffset FirstRaisedUtc { get; init; }

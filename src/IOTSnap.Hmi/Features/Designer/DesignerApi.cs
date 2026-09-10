@@ -2,6 +2,7 @@ using IOTSnap.Hmi.Data;
 using IOTSnap.Hmi.Data.Entities;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 namespace IOTSnap.Hmi.Features.Designer;
 
@@ -18,6 +19,8 @@ public static class DesignerApi
         group.MapPut("/screens/{screenId:int}", UpdateScreenAsync);
         group.MapDelete("/screens/{screenId:int}", DeleteScreenAsync);
         group.MapPost("/screens/{screenId:int}/publish", PublishScreenAsync);
+        group.MapPost("/screens/{screenId:int}/rollback/{publicationId:long}", RollbackScreenAsync);
+        group.MapGet("/audit", GetAuditAsync);
 
         return app;
     }
@@ -226,10 +229,16 @@ public static class DesignerApi
     private static async Task<IResult> DeleteScreenAsync(int screenId, IDbContextFactory<HmiDbContext> dbFactory, CancellationToken cancellationToken)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
-        var screen = await db.HmiScreens.FirstOrDefaultAsync(x => x.Id == screenId, cancellationToken);
+        var screen = await db.HmiScreens.Include(x => x.Widgets).ThenInclude(x => x.Bindings).FirstOrDefaultAsync(x => x.Id == screenId, cancellationToken);
         if (screen is null)
         {
             return Results.NotFound();
+        }
+
+        var publishError = await ValidatePublishAsync(screen, db, cancellationToken);
+        if (publishError is not null)
+        {
+            return Results.BadRequest(new { error = publishError });
         }
 
         db.HmiScreens.Remove(screen);
@@ -237,20 +246,126 @@ public static class DesignerApi
         return Results.NoContent();
     }
 
-    private static async Task<IResult> PublishScreenAsync(int screenId, IDbContextFactory<HmiDbContext> dbFactory, CancellationToken cancellationToken)
+    private static async Task<IResult> PublishScreenAsync(int screenId, HttpContext httpContext, IDbContextFactory<HmiDbContext> dbFactory, RuntimeAuditService auditService, CancellationToken cancellationToken)
     {
         await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
-        var screen = await db.HmiScreens.FirstOrDefaultAsync(x => x.Id == screenId, cancellationToken);
+        var screen = await db.HmiScreens
+            .Include(x => x.Widgets)
+                .ThenInclude(x => x.Bindings)
+            .FirstOrDefaultAsync(x => x.Id == screenId, cancellationToken);
         if (screen is null)
         {
             return Results.NotFound();
         }
 
+        var publishError = await ValidatePublishAsync(screen, db, cancellationToken);
+        if (publishError is not null)
+        {
+            return Results.BadRequest(new { error = publishError });
+        }
+
         screen.IsPublished = true;
         screen.PublishedUtc = DateTimeOffset.UtcNow;
         screen.UpdatedUtc = DateTimeOffset.UtcNow;
+
+        var actor = RuntimeAccessPolicy.ResolveActor(httpContext.User);
+        db.HmiScreenPublications.Add(new HmiScreenPublication
+        {
+            HmiScreenId = screen.Id,
+            Slug = screen.Slug,
+            SnapshotJson = JsonSerializer.Serialize(ToScreenDetail(screen)),
+            PublishedBy = actor?.Username,
+            PublishedUtc = screen.PublishedUtc.Value
+        });
         await db.SaveChangesAsync(cancellationToken);
 
+        if (actor is not null)
+        {
+            await auditService.RecordAsync(actor, "ScreenPublished", screen.Slug, "Succeeded", null, null, cancellationToken);
+        }
+
+        return Results.Ok(new { screen.Id, screen.Slug, screen.PublishedUtc });
+    }
+
+    private static async Task<IResult> GetAuditAsync(string? actionType, string? actor, DateTimeOffset? fromUtc, DateTimeOffset? toUtc, int? page, int? pageSize, IDbContextFactory<HmiDbContext> dbFactory, CancellationToken cancellationToken)
+    {
+        var start = fromUtc ?? DateTimeOffset.UtcNow.AddDays(-7);
+        var end = toUtc ?? DateTimeOffset.UtcNow;
+        if (start > end || end - start > TimeSpan.FromDays(31)) return Results.BadRequest(new { error = "Use a range no greater than 31 days." });
+        var currentPage = Math.Max(1, page ?? 1);
+        var size = Math.Clamp(pageSize ?? 100, 1, 500);
+        await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+        var query = db.OperatorAuditEntries.AsNoTracking();
+        if (!string.IsNullOrWhiteSpace(actionType)) query = query.Where(x => x.ActionType == actionType);
+        if (!string.IsNullOrWhiteSpace(actor)) query = query.Where(x => x.ActorUsername == actor);
+        var filtered = (await query.ToListAsync(cancellationToken))
+            .Where(x => x.OccurredUtc >= start && x.OccurredUtc <= end)
+            .OrderByDescending(x => x.OccurredUtc)
+            .ToList();
+        var total = filtered.Count;
+        var items = filtered.Skip((currentPage - 1) * size).Take(size).ToList();
+        return Results.Ok(new { total, page = currentPage, pageSize = size, items });
+    }
+
+    private static async Task<IResult> RollbackScreenAsync(int screenId, long publicationId, HttpContext httpContext, IDbContextFactory<HmiDbContext> dbFactory, RuntimeAuditService auditService, CancellationToken cancellationToken)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(cancellationToken);
+        var screen = await db.HmiScreens.Include(x => x.Widgets).ThenInclude(x => x.Bindings).FirstOrDefaultAsync(x => x.Id == screenId, cancellationToken);
+        var publication = await db.HmiScreenPublications.FirstOrDefaultAsync(x => x.Id == publicationId && x.HmiScreenId == screenId, cancellationToken);
+        if (screen is null || publication is null) return Results.NotFound();
+
+        ScreenDetailDto? snapshot;
+        try { snapshot = JsonSerializer.Deserialize<ScreenDetailDto>(publication.SnapshotJson); }
+        catch (JsonException) { return Results.BadRequest(new { error = "The selected publication snapshot is invalid." }); }
+        if (snapshot is null) return Results.BadRequest(new { error = "The selected publication snapshot is empty." });
+
+        db.HmiWidgetBindings.RemoveRange(screen.Widgets.SelectMany(x => x.Bindings));
+        db.HmiWidgets.RemoveRange(screen.Widgets);
+        screen.Widgets.Clear();
+        screen.Name = snapshot.Name;
+        screen.Slug = snapshot.Slug;
+        screen.Width = snapshot.Width;
+        screen.Height = snapshot.Height;
+        screen.IsPublished = true;
+        screen.PublishedUtc = DateTimeOffset.UtcNow;
+        screen.UpdatedUtc = screen.PublishedUtc.Value;
+
+        foreach (var widgetSnapshot in snapshot.Widgets)
+        {
+            var widget = new HmiWidget
+            {
+                Key = widgetSnapshot.Key,
+                WidgetType = widgetSnapshot.WidgetType,
+                Title = widgetSnapshot.Title,
+                X = widgetSnapshot.X,
+                Y = widgetSnapshot.Y,
+                Width = widgetSnapshot.Width,
+                Height = widgetSnapshot.Height,
+                ZIndex = widgetSnapshot.ZIndex,
+                PropertiesJson = widgetSnapshot.PropertiesJson,
+                UpdatedUtc = screen.UpdatedUtc
+            };
+            foreach (var bindingSnapshot in widgetSnapshot.Bindings)
+            {
+                widget.Bindings.Add(new HmiWidgetBinding
+                {
+                    BindingRole = bindingSnapshot.BindingRole,
+                    SourceType = bindingSnapshot.SourceType,
+                    SourceKey = bindingSnapshot.SourceKey,
+                    WriteRequiresConfirm = bindingSnapshot.WriteRequiresConfirm,
+                    MinRole = bindingSnapshot.MinRole,
+                    UpdatedUtc = screen.UpdatedUtc
+                });
+            }
+            screen.Widgets.Add(widget);
+        }
+
+        var validationError = await ValidatePublishAsync(screen, db, cancellationToken);
+        if (validationError is not null) return Results.BadRequest(new { error = validationError });
+        var actor = RuntimeAccessPolicy.ResolveActor(httpContext.User);
+        db.HmiScreenPublications.Add(new HmiScreenPublication { HmiScreenId = screen.Id, Slug = screen.Slug, SnapshotJson = JsonSerializer.Serialize(snapshot), PublishedBy = actor?.Username, PublishedUtc = screen.PublishedUtc.Value });
+        await db.SaveChangesAsync(cancellationToken);
+        if (actor is not null) await auditService.RecordAsync(actor, "ScreenRolledBack", screen.Slug, "Succeeded", publication.Id.ToString(), null, cancellationToken);
         return Results.Ok(new { screen.Id, screen.Slug, screen.PublishedUtc });
     }
 
@@ -307,6 +422,16 @@ public static class DesignerApi
             return "At least one widget is required.";
         }
 
+        if (request.Width < 320 || request.Height < 240)
+        {
+            return "Screen dimensions must be at least 320 by 240.";
+        }
+
+        if (request.Widgets.GroupBy(x => x.Key.Trim(), StringComparer.OrdinalIgnoreCase).Any(x => x.Count() > 1))
+        {
+            return "Widget keys must be unique within a screen.";
+        }
+
         return null;
     }
 
@@ -326,6 +451,26 @@ public static class DesignerApi
         if (widget.Width <= 0 || widget.Height <= 0)
         {
             return "Widget width and height must be greater than zero.";
+        }
+
+        try
+        {
+            using var _ = JsonDocument.Parse(string.IsNullOrWhiteSpace(widget.PropertiesJson) ? "{}" : widget.PropertiesJson);
+        }
+        catch (JsonException)
+        {
+            return $"Widget '{widget.Key}' has invalid property JSON.";
+        }
+
+        var properties = HmiWidgetProperties.Parse(widget.PropertiesJson);
+        if (properties.ValueMin is not null && properties.ValueMax is not null && properties.ValueMin > properties.ValueMax)
+        {
+            return $"Widget '{widget.Key}' has an invalid value range.";
+        }
+
+        if (properties.InputMin is not null && properties.InputMax is not null && properties.InputMin > properties.InputMax)
+        {
+            return $"Widget '{widget.Key}' has an invalid input range.";
         }
 
         return null;
@@ -353,6 +498,33 @@ public static class DesignerApi
             return "Only 'OpcTag' source type is supported in v1.";
         }
 
+        return null;
+    }
+
+    private static async Task<string?> ValidatePublishAsync(HmiScreen screen, HmiDbContext db, CancellationToken cancellationToken)
+    {
+        if (screen.Widgets.Count == 0) return "A published screen requires at least one widget.";
+        if (screen.Widgets.GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase).Any(x => x.Count() > 1)) return "Widget keys must be unique within a screen.";
+
+        foreach (var widget in screen.Widgets)
+        {
+            if (widget.X < 0 || widget.Y < 0 || widget.X + widget.Width > screen.Width || widget.Y + widget.Height > screen.Height)
+                return $"Widget '{widget.Key}' is outside the screen bounds.";
+
+            if (widget.Bindings.GroupBy(x => x.BindingRole, StringComparer.OrdinalIgnoreCase).Any(x => x.Count() > 1))
+                return $"Widget '{widget.Key}' has duplicate binding roles.";
+
+            try { using var _ = JsonDocument.Parse(widget.PropertiesJson); }
+            catch (JsonException) { return $"Widget '{widget.Key}' has invalid property JSON."; }
+
+            foreach (var binding in widget.Bindings)
+            {
+                var mapping = await db.OpcUaNodeMappings.AsNoTracking().FirstOrDefaultAsync(x => x.NodeId == binding.SourceKey, cancellationToken);
+                if (mapping is null) return $"Binding '{binding.SourceKey}' is not a configured OPC UA mapping.";
+                if (widget.WidgetType.Equals("CommandButton", StringComparison.OrdinalIgnoreCase) && !mapping.IsWritable)
+                    return $"Command widget '{widget.Key}' requires a writable mapping.";
+            }
+        }
         return null;
     }
 

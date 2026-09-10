@@ -1,0 +1,13 @@
+{
+  "Folder": "Harness",
+  "NodeList": [
+    {
+      "NodeId": "Plant.Line.Start",
+      "Name": "StartCommand",
+      "DataType": "Boolean",
+      "ValueRank": -1,
+      "AccessLevel": "CurrentReadOrWrite",
+      "Description": "Writable start command used by HMI release qualification"
+    }
+  ]
+}

@@ -12,6 +12,7 @@ public sealed class OpcUaConnectionProfile
     public string AuthenticationMode { get; set; } = "Anonymous";
     public string? Username { get; set; }
     public string? Password { get; set; }
+    public string? ProtectedPassword { get; set; }
     public int PublishingIntervalMs { get; set; } = 1000;
     public DateTimeOffset UpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
 

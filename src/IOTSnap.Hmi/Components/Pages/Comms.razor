@@ -1,8 +1,15 @@
 @page "/comms"
 @attribute [Authorize]
+@using Microsoft.AspNetCore.DataProtection
+@using Microsoft.AspNetCore.Components.Forms
 @inject IDbContextFactory<HmiDbContext> DbContextFactory
 @inject IOpcUaRuntime OpcUaRuntime
+@inject IOpcUaDiscovery OpcUaDiscovery
+@inject IOpcUaCertificateStore OpcUaCertificateStore
 @inject AuthenticationStateProvider AuthenticationStateProvider
+@inject Microsoft.AspNetCore.DataProtection.IDataProtectionProvider DataProtectionProvider
+@inject RuntimeAuditService AuditService
+@using IOTSnap.Hmi.Features.Designer
 @implements IAsyncDisposable
 
 <PageTitle>Communications</PageTitle>
@@ -73,6 +80,49 @@
 </section>
 
 <section class="panel-card">
+    <div class="panel-label">Trusted Certificates</div>
+    <p>Import trusted application or issuer certificates into the local HMI trust store without shell access.</p>
+    <div class="hmi-form-grid hmi-form-grid-2">
+        <label>
+            <span>Trust Store</span>
+            <select @bind="_certificateImportTarget">
+                <option value="@nameof(OpcUaTrustStoreKind.ApplicationPeer)">Trusted Application</option>
+                <option value="@nameof(OpcUaTrustStoreKind.IssuerAuthority)">Trusted Issuer</option>
+            </select>
+        </label>
+        <label>
+            <span>Certificate File</span>
+            <InputFile OnChange="OnTrustedCertificateSelectedAsync" accept=".cer,.crt,.der,.pem,application/x-x509-ca-cert" disabled="@_isImportingCertificate" />
+        </label>
+    </div>
+
+    @if (_trustedCertificates.Count > 0)
+    {
+        <table class="hmi-table">
+            <thead>
+                <tr>
+                    <th>Store</th>
+                    <th>Subject</th>
+                    <th>Thumbprint</th>
+                    <th>Imported</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var certificate in _trustedCertificates)
+                {
+                    <tr>
+                        <td>@DescribeTrustStore(certificate.TrustKind)</td>
+                        <td>@certificate.Subject</td>
+                        <td>@certificate.Thumbprint</td>
+                        <td>@certificate.ImportedUtc.ToLocalTime().ToString("u")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+<section class="panel-card">
     <div class="panel-label">Connection Actions</div>
     <div class="button-row">
         <button class="hmi-primary-button" @onclick="RefreshConnectionAsync">Refresh Connection</button>
@@ -85,6 +135,109 @@
         <li class="diag-item">Enable the profile only after the endpoint and credentials are verified.</li>
         <li class="diag-item">Refresh the connection after changing the endpoint, security options, or mapped nodes.</li>
     </ul>
+</section>
+
+<section class="panel-card">
+    <div class="panel-label">Server Discovery</div>
+    <p>Discover reachable OPC UA endpoints and browse their tags before applying a profile.</p>
+    <div class="hmi-form-grid hmi-form-grid-3">
+        <label>
+            <span>Discovery URL</span>
+            <input @bind="_discoveryUrl" maxlength="512" placeholder="opc.tcp://192.168.1.26:50000" />
+        </label>
+        <label>
+            <span>Auth Mode For Browse</span>
+            <select @bind="_discoveryAuthenticationMode">
+                <option value="Anonymous">Anonymous</option>
+                <option value="UsernamePassword">UsernamePassword</option>
+            </select>
+        </label>
+        <label>
+            <span>Browse Depth</span>
+            <input type="number" min="1" max="12" step="1" @bind="_browseDepth" />
+        </label>
+    </div>
+    @if (_discoveryAuthenticationMode == "UsernamePassword")
+    {
+        <div class="hmi-form-grid hmi-form-grid-2">
+            <label>
+                <span>Browse Username</span>
+                <input @bind="_discoveryUsername" maxlength="128" />
+            </label>
+            <label>
+                <span>Browse Password</span>
+                <input type="password" @bind="_discoveryPassword" />
+            </label>
+        </div>
+    }
+    <div class="button-row">
+        <button class="hmi-primary-button" @onclick="DiscoverEndpointsAsync" disabled="@_isDiscovering">Discover Endpoints</button>
+        <button class="hmi-ghost-button" @onclick="BrowseSelectedEndpointAsync" disabled="@(_selectedDiscoveredEndpoint is null || _isBrowsingTags)">Browse Tags</button>
+    </div>
+
+    @if (_discoveredEndpoints.Count > 0)
+    {
+        <table class="hmi-table">
+            <thead>
+                <tr>
+                    <th>Endpoint</th>
+                    <th>Server</th>
+                    <th>Security</th>
+                    <th>Auth</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var endpoint in _discoveredEndpoints)
+                {
+                    <tr class="@(ReferenceEquals(_selectedDiscoveredEndpoint, endpoint) ? "selected-row" : string.Empty)">
+                        <td>@endpoint.EndpointUrl</td>
+                        <td>@endpoint.ApplicationName</td>
+                        <td>@endpoint.SecurityMode / @endpoint.SecurityPolicy</td>
+                        <td>@DescribeAuth(endpoint)</td>
+                        <td>
+                            <div class="inline-action-row">
+                                <button class="hmi-ghost-button" @onclick="() => SelectDiscoveredEndpoint(endpoint)">Select</button>
+                                <button class="hmi-primary-button" @onclick="() => ApplyDiscoveredEndpoint(endpoint)">Apply</button>
+                            </div>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    @if (_discoveredTags.Count > 0)
+    {
+        <div class="setting-value">Browsable tags from @(_selectedDiscoveredEndpoint?.EndpointUrl ?? _discoveryUrl)</div>
+        <table class="hmi-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>NodeId</th>
+                    <th>Path</th>
+                    <th>Type</th>
+                    <th>Writable</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var tag in _discoveredTags)
+                {
+                    <tr>
+                        <td>@tag.DisplayName</td>
+                        <td>@tag.NodeId</td>
+                        <td>@tag.BrowsePath</td>
+                        <td>@tag.DataType</td>
+                        <td>@(tag.IsWritable ? "Yes" : "No")</td>
+                        <td>
+                            <button class="hmi-ghost-button" @onclick="() => StageDiscoveredTag(tag)">Stage Mapping</button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
 </section>
 
 <section class="panel-card">
@@ -380,7 +533,20 @@
     private bool _messageIsError;
     private bool _canWrite;
     private bool _canAcknowledge;
+    private bool _isDiscovering;
+    private bool _isBrowsingTags;
+    private bool _isImportingCertificate;
     private string _currentUsername = "operator";
+    private string _discoveryUrl = "opc.tcp://127.0.0.1:4840";
+    private string _discoveryAuthenticationMode = "Anonymous";
+    private string? _discoveryUsername;
+    private string? _discoveryPassword;
+    private int _browseDepth = 6;
+    private string _certificateImportTarget = nameof(OpcUaTrustStoreKind.ApplicationPeer);
+    private List<OpcUaDiscoveredEndpoint> _discoveredEndpoints = new();
+    private OpcUaDiscoveredEndpoint? _selectedDiscoveredEndpoint;
+    private List<OpcUaDiscoveredTag> _discoveredTags = new();
+    private List<OpcUaTrustedCertificateSummary> _trustedCertificates = new();
     private readonly CancellationTokenSource _pollingCts = new();
     private Task? _pollingTask;
     private readonly Dictionary<string, string> _pendingWrites = new(StringComparer.OrdinalIgnoreCase);
@@ -406,14 +572,26 @@
     private async Task LoadStateAsync()
     {
         await using var db = await DbContextFactory.CreateDbContextAsync();
-        _profile = await db.OpcUaConnectionProfiles
+        var profiles = await db.OpcUaConnectionProfiles
             .Include(x => x.NodeMappings)
+            .ToListAsync();
+        _profile = profiles
             .OrderByDescending(x => x.UpdatedUtc)
-            .FirstOrDefaultAsync();
+            .FirstOrDefault();
+        if (_profile is not null)
+        {
+            // Credentials are write-only; never place persisted secrets in component state.
+            _profile.Password = null;
+            if (string.IsNullOrWhiteSpace(_discoveryUrl))
+            {
+                _discoveryUrl = _profile.EndpointUrl;
+            }
+        }
         _nodes = _profile?.NodeMappings.OrderBy(x => x.DisplayName).ToList() ?? new();
         _runtimeStatus = await OpcUaRuntime.GetStatusAsync();
         _tagSnapshots = await OpcUaRuntime.GetTagSnapshotsAsync();
         _alarms = await OpcUaRuntime.GetAlarmsAsync();
+        _trustedCertificates = (await OpcUaCertificateStore.ListTrustedCertificatesAsync()).ToList();
         UpdateTagHealthCounts();
         UpdateAlarmCounts();
     }
@@ -467,6 +645,7 @@
         persisted.Enabled = enabled;
         persisted.UpdatedUtc = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
+        await RecordAuditAsync("OpcUaProfileEnabledStateChanged", persisted.Name, enabled ? "Enabled" : "Disabled");
         await OpcUaRuntime.RefreshNowAsync();
         SetMessage(enabled ? "Profile enabled." : "Profile disabled.", false);
         await LoadStateAsync();
@@ -503,15 +682,148 @@
         persisted.SecurityMode = _profile.SecurityMode.Trim();
         persisted.PublishingIntervalMs = Math.Max(100, _profile.PublishingIntervalMs);
         persisted.Username = string.IsNullOrWhiteSpace(_profile.Username) ? null : _profile.Username.Trim();
-        persisted.Password = string.IsNullOrWhiteSpace(_profile.Password) ? null : _profile.Password;
+        if (!string.IsNullOrWhiteSpace(_profile.Password))
+        {
+            persisted.ProtectedPassword = DataProtectionProvider
+                .CreateProtector("IOTSnap.Hmi.OpcUaProfilePassword.v1")
+                .Protect(_profile.Password);
+            persisted.Password = null;
+        }
         persisted.Enabled = _profile.Enabled;
         persisted.UseSecurity = _profile.UseSecurity;
         persisted.UpdatedUtc = DateTimeOffset.UtcNow;
 
         await db.SaveChangesAsync();
+        await RecordAuditAsync("OpcUaProfileChanged", persisted.Name, "Succeeded");
         await OpcUaRuntime.RefreshNowAsync();
         SetMessage("Profile saved.", false);
         await LoadStateAsync();
+    }
+
+    private async Task OnTrustedCertificateSelectedAsync(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        _isImportingCertificate = true;
+
+        try
+        {
+            var trustKind = Enum.Parse<OpcUaTrustStoreKind>(_certificateImportTarget, ignoreCase: true);
+            await using var stream = file.OpenReadStream(2 * 1024 * 1024);
+            var imported = await OpcUaCertificateStore.ImportTrustedCertificateAsync(file.Name, stream, trustKind);
+            await RecordAuditAsync("OpcUaTrustedCertificateImported", imported.Thumbprint, "Succeeded");
+            await OpcUaRuntime.RefreshNowAsync();
+            SetMessage($"Imported {imported.Subject} into {DescribeTrustStore(imported.TrustKind)}.", false);
+            await LoadStateAsync();
+        }
+        catch (Exception ex)
+        {
+            SetMessage($"Certificate import failed: {ex.Message}", true);
+        }
+        finally
+        {
+            _isImportingCertificate = false;
+        }
+    }
+
+    private async Task DiscoverEndpointsAsync()
+    {
+        _isDiscovering = true;
+        _discoveredTags.Clear();
+        _selectedDiscoveredEndpoint = null;
+
+        try
+        {
+            _discoveredEndpoints = (await OpcUaDiscovery.DiscoverEndpointsAsync(_discoveryUrl))
+                .ToList();
+            if (_discoveredEndpoints.Count == 0)
+            {
+                SetMessage("No OPC UA endpoints were discovered at the supplied URL.", true);
+                return;
+            }
+
+            _selectedDiscoveredEndpoint = _discoveredEndpoints[0];
+            SetMessage($"Discovered {_discoveredEndpoints.Count} endpoint(s).", false);
+        }
+        catch (Exception ex)
+        {
+            _discoveredEndpoints.Clear();
+            SetMessage($"Discovery failed: {ex.Message}", true);
+        }
+        finally
+        {
+            _isDiscovering = false;
+        }
+    }
+
+    private void SelectDiscoveredEndpoint(OpcUaDiscoveredEndpoint endpoint)
+    {
+        _selectedDiscoveredEndpoint = endpoint;
+    }
+
+    private void ApplyDiscoveredEndpoint(OpcUaDiscoveredEndpoint endpoint)
+    {
+        if (_profile is null)
+        {
+            SetMessage("No profile selected.", true);
+            return;
+        }
+
+        _selectedDiscoveredEndpoint = endpoint;
+        _profile.EndpointUrl = endpoint.EndpointUrl;
+        _profile.UseSecurity = endpoint.UseSecurity;
+        _profile.SecurityPolicy = endpoint.SecurityPolicy;
+        _profile.SecurityMode = endpoint.SecurityMode;
+        _profile.AuthenticationMode = endpoint.SupportsAnonymous ? "Anonymous" : "UsernamePassword";
+        _discoveryUrl = endpoint.EndpointUrl;
+        SetMessage($"Applied discovered endpoint {endpoint.EndpointUrl} to the profile. Save to persist it.", false);
+    }
+
+    private async Task BrowseSelectedEndpointAsync()
+    {
+        if (_selectedDiscoveredEndpoint is null)
+        {
+            SetMessage("Select a discovered endpoint before browsing tags.", true);
+            return;
+        }
+
+        _isBrowsingTags = true;
+
+        try
+        {
+            var request = new OpcUaBrowseRequest(
+                _selectedDiscoveredEndpoint.EndpointUrl,
+                _selectedDiscoveredEndpoint.UseSecurity,
+                _selectedDiscoveredEndpoint.SecurityPolicy,
+                _selectedDiscoveredEndpoint.SecurityMode,
+                _discoveryAuthenticationMode,
+                _discoveryUsername,
+                _discoveryPassword,
+                Math.Clamp(_browseDepth, 1, 12));
+
+            _discoveredTags = (await OpcUaDiscovery.BrowseTagsAsync(request)).ToList();
+            SetMessage(_discoveredTags.Count == 0
+                ? "The selected endpoint did not return any browsable variable tags."
+                : $"Discovered {_discoveredTags.Count} tag(s).", _discoveredTags.Count == 0);
+        }
+        catch (Exception ex)
+        {
+            _discoveredTags.Clear();
+            SetMessage($"Tag browse failed: {ex.Message}", true);
+        }
+        finally
+        {
+            _isBrowsingTags = false;
+        }
+    }
+
+    private void StageDiscoveredTag(OpcUaDiscoveredTag tag)
+    {
+        _newNode.DisplayName = tag.DisplayName;
+        _newNode.NodeId = tag.NodeId;
+        _newNode.Area = DeriveArea(tag.BrowsePath);
+        _newNode.DataType = tag.DataType;
+        _newNode.IsWritable = tag.IsWritable;
+        SetMessage($"Staged {tag.NodeId} for a new mapping. Review it below and click Add Node.", false);
     }
 
     private async Task AddNodeAsync()
@@ -550,6 +862,7 @@
         profile.UpdatedUtc = DateTimeOffset.UtcNow;
 
         await db.SaveChangesAsync();
+        await RecordAuditAsync("OpcUaNodeAdded", _newNode.NodeId, "Succeeded");
         await OpcUaRuntime.RefreshNowAsync();
         _newNode = new NodeDraft();
         SetMessage("Node added.", false);
@@ -575,6 +888,7 @@
 
         db.OpcUaNodeMappings.Remove(node);
         await db.SaveChangesAsync();
+        await RecordAuditAsync("OpcUaNodeDeleted", node.NodeId, "Succeeded");
         await OpcUaRuntime.RefreshNowAsync();
         SetMessage("Node deleted.", false);
         await LoadStateAsync();
@@ -584,6 +898,36 @@
     {
         _message = message;
         _messageIsError = isError;
+    }
+
+    private async Task RecordAuditAsync(string action, string resource, string result)
+    {
+        var actor = RuntimeAccessPolicy.ResolveActor((await AuthenticationStateProvider.GetAuthenticationStateAsync()).User);
+        if (actor is not null)
+        {
+            await AuditService.RecordAsync(actor, action, resource, result, null, null, CancellationToken.None);
+        }
+    }
+
+    private static string DescribeAuth(OpcUaDiscoveredEndpoint endpoint)
+        => endpoint.SupportsAnonymous && endpoint.SupportsUsernamePassword
+            ? "Anonymous, UsernamePassword"
+            : endpoint.SupportsUsernamePassword
+                ? "UsernamePassword"
+                : "Anonymous";
+
+    private static string DescribeTrustStore(OpcUaTrustStoreKind trustKind)
+        => trustKind switch
+        {
+            OpcUaTrustStoreKind.ApplicationPeer => "Trusted Application",
+            OpcUaTrustStoreKind.IssuerAuthority => "Trusted Issuer",
+            _ => trustKind.ToString()
+        };
+
+    private static string DeriveArea(string browsePath)
+    {
+        var segments = browsePath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return segments.Length >= 2 ? segments[^2] : "Discovered";
     }
 
     private string GetPendingWriteValue(OpcUaTagSnapshot tag)

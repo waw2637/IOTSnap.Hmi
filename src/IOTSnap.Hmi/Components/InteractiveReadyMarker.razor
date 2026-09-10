@@ -1,0 +1,29 @@
+@inject IJSRuntime JSRuntime
+
+@code {
+    private bool _markedReady;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_markedReady)
+        {
+            return;
+        }
+
+        try
+        {
+            await JSRuntime.InvokeVoidAsync("hmiMarkInteractiveReady");
+            _markedReady = true;
+        }
+        catch (InvalidOperationException)
+        {
+            // JS interop is unavailable during prerender; the next interactive render will retry.
+        }
+        catch (JSException)
+        {
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+    }
+}

@@ -13,6 +13,11 @@ public sealed class HmiDbContext(DbContextOptions<HmiDbContext> options) : DbCon
     public DbSet<HmiScreen> HmiScreens => Set<HmiScreen>();
     public DbSet<HmiWidget> HmiWidgets => Set<HmiWidget>();
     public DbSet<HmiWidgetBinding> HmiWidgetBindings => Set<HmiWidgetBinding>();
+    public DbSet<HmiScreenPublication> HmiScreenPublications => Set<HmiScreenPublication>();
+    public DbSet<OperatorCommand> OperatorCommands => Set<OperatorCommand>();
+    public DbSet<OperatorAuditEntry> OperatorAuditEntries => Set<OperatorAuditEntry>();
+    public DbSet<OpcUaTrendSample> OpcUaTrendSamples => Set<OpcUaTrendSample>();
+    public DbSet<OpcUaAlarmTransition> OpcUaAlarmTransitions => Set<OpcUaAlarmTransition>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -42,6 +47,7 @@ public sealed class HmiDbContext(DbContextOptions<HmiDbContext> options) : DbCon
             entity.Property(x => x.SecurityMode).HasMaxLength(64);
             entity.Property(x => x.AuthenticationMode).HasMaxLength(32);
             entity.Property(x => x.Username).HasMaxLength(128);
+            entity.Property(x => x.ProtectedPassword).HasMaxLength(2048);
         });
 
         modelBuilder.Entity<OpcUaNodeMapping>(entity =>
@@ -61,6 +67,7 @@ public sealed class HmiDbContext(DbContextOptions<HmiDbContext> options) : DbCon
             entity.Property(x => x.DataType).HasMaxLength(32);
             entity.Property(x => x.StatusCode).HasMaxLength(64);
             entity.Property(x => x.AlarmText).HasMaxLength(256);
+            entity.Property(x => x.Severity).HasDefaultValue(500);
             entity.Property(x => x.AcknowledgedBy).HasMaxLength(128);
         });
 
@@ -87,6 +94,61 @@ public sealed class HmiDbContext(DbContextOptions<HmiDbContext> options) : DbCon
             entity.Property(x => x.SourceType).HasMaxLength(32);
             entity.Property(x => x.SourceKey).HasMaxLength(256);
             entity.Property(x => x.MinRole).HasMaxLength(32);
+        });
+
+        modelBuilder.Entity<HmiScreenPublication>(entity =>
+        {
+            entity.HasIndex(x => new { x.HmiScreenId, x.PublishedUtc });
+            entity.Property(x => x.Slug).HasMaxLength(64);
+            entity.Property(x => x.SnapshotJson).HasMaxLength(20000);
+            entity.Property(x => x.PublishedBy).HasMaxLength(64);
+        });
+
+        modelBuilder.Entity<OperatorCommand>(entity =>
+        {
+            entity.HasIndex(x => x.CommandId).IsUnique();
+            entity.HasIndex(x => new { x.ActorUsername, x.IdempotencyKey }).IsUnique();
+            entity.Property(x => x.CommandId).HasMaxLength(64);
+            entity.Property(x => x.IdempotencyKey).HasMaxLength(128);
+            entity.Property(x => x.ActorUsername).HasMaxLength(64);
+            entity.Property(x => x.ActorRole).HasMaxLength(32);
+            entity.Property(x => x.ScreenSlug).HasMaxLength(64);
+            entity.Property(x => x.WidgetKey).HasMaxLength(64);
+            entity.Property(x => x.BindingRole).HasMaxLength(64);
+            entity.Property(x => x.NodeId).HasMaxLength(256);
+            entity.Property(x => x.RequestedValue).HasMaxLength(256);
+            entity.Property(x => x.Status).HasMaxLength(32);
+            entity.Property(x => x.OpcUaResponse).HasMaxLength(512);
+            entity.Property(x => x.ObservedValue).HasMaxLength(256);
+        });
+
+        modelBuilder.Entity<OperatorAuditEntry>(entity =>
+        {
+            entity.HasIndex(x => x.OccurredUtc);
+            entity.Property(x => x.ActorUsername).HasMaxLength(64);
+            entity.Property(x => x.ActorRole).HasMaxLength(32);
+            entity.Property(x => x.ActionType).HasMaxLength(64);
+            entity.Property(x => x.Resource).HasMaxLength(256);
+            entity.Property(x => x.Result).HasMaxLength(32);
+            entity.Property(x => x.CorrelationId).HasMaxLength(64);
+            entity.Property(x => x.Detail).HasMaxLength(512);
+        });
+
+        modelBuilder.Entity<OpcUaTrendSample>(entity =>
+        {
+            entity.HasIndex(x => new { x.NodeId, x.SampledUtc });
+            entity.Property(x => x.NodeId).HasMaxLength(256);
+            entity.Property(x => x.ValueText).HasMaxLength(256);
+            entity.Property(x => x.StatusCode).HasMaxLength(64);
+        });
+
+        modelBuilder.Entity<OpcUaAlarmTransition>(entity =>
+        {
+            entity.HasIndex(x => new { x.NodeId, x.OccurredUtc });
+            entity.Property(x => x.NodeId).HasMaxLength(256);
+            entity.Property(x => x.Transition).HasMaxLength(32);
+            entity.Property(x => x.ActorUsername).HasMaxLength(64);
+            entity.Property(x => x.Detail).HasMaxLength(256);
         });
     }
 }

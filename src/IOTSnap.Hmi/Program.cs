@@ -4,10 +4,15 @@ using IOTSnap.Hmi.Data;
 using IOTSnap.Hmi.Data.Entities;
 using IOTSnap.Hmi.Features.Designer;
 using IOTSnap.Hmi.Runtime;
+using IOTSnap.Hmi.Runtime.OpcUa;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using MudBlazor.Services;
 
 namespace IOTSnap.Hmi;
 
@@ -16,21 +21,32 @@ public class Program
     public static async Task Main(string[] args)
     {
         var builder = WebApplication.CreateBuilder(args);
-        var dataDirectory = Path.Combine(builder.Environment.ContentRootPath, "data");
+        var dataDirectory = builder.Configuration["Hmi:DataDirectory"];
+        if (string.IsNullOrWhiteSpace(dataDirectory))
+        {
+            dataDirectory = Path.Combine(builder.Environment.ContentRootPath, "data");
+        }
+
         Directory.CreateDirectory(dataDirectory);
+        var keyDirectory = Path.Combine(dataDirectory, "keys");
+        Directory.CreateDirectory(keyDirectory);
         var connectionString = (builder.Configuration.GetConnectionString("Hmi")
             ?? "Data Source={DataDirectory}/iotsnap-hmi.db")
             .Replace("{DataDirectory}", dataDirectory);
 
         builder.Services.AddRazorComponents()
             .AddInteractiveServerComponents();
+        builder.Services.AddMudServices();
         builder.Services.AddCascadingAuthenticationState();
         builder.Services.AddHttpContextAccessor();
+        builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo(keyDirectory));
         builder.Services.AddScoped(_ => new HttpClient
         {
             BaseAddress = new Uri(GetBaseAddress(builder))
         });
         builder.Services.AddScoped<IPasswordHasher<LocalUser>, PasswordHasher<LocalUser>>();
+        builder.Services.AddScoped<RuntimeCommandService>();
+        builder.Services.AddScoped<RuntimeAuditService>();
         builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
             .AddCookie(options =>
             {
@@ -53,6 +69,18 @@ public class Program
         }
 
         app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
+        app.UseWhen(
+            context => context.Request.Path.StartsWithSegments("/api/hmi/runtime", StringComparison.OrdinalIgnoreCase),
+            branch => branch.Use(async (context, next) =>
+            {
+                var feature = context.Features.Get<IStatusCodePagesFeature>();
+                if (feature is not null)
+                {
+                    feature.Enabled = false;
+                }
+
+                await next();
+            }));
         app.UseHttpsRedirection();
         app.UseAuthentication();
         app.UseAuthorization();
@@ -83,13 +111,13 @@ public class Program
 
         await EnsureDatabaseReadyAsync(app.Services, app.Logger);
 
-        app.MapPost("/login", async (
+        app.MapPost("/login/submit", async (
             HttpContext httpContext,
             IDbContextFactory<HmiDbContext> dbContextFactory,
             IPasswordHasher<LocalUser> passwordHasher,
-            string username,
-            string password,
-            string? returnUrl) =>
+            [FromForm] string username,
+            [FromForm] string password,
+            [FromForm] string? returnUrl) =>
         {
             await using var db = await dbContextFactory.CreateDbContextAsync(httpContext.RequestAborted);
             var hasUsers = await db.LocalUsers.AnyAsync(httpContext.RequestAborted);
@@ -140,13 +168,70 @@ public class Program
             return Results.LocalRedirect("/login");
         }).DisableAntiforgery();
 
+        app.MapGet("/favicon.ico", (IWebHostEnvironment environment) =>
+            Results.File(
+                Path.Combine(environment.WebRootPath, "favicon.svg"),
+                "image/svg+xml"))
+            .AllowAnonymous();
+
+        app.MapGet("/setup/finalize", async (
+            string? token,
+            HttpContext httpContext,
+            IDataProtectionProvider dataProtectionProvider,
+            IDbContextFactory<HmiDbContext> dbContextFactory) =>
+        {
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                return Results.LocalRedirect("/setup");
+            }
+
+            string payload;
+            try
+            {
+                payload = dataProtectionProvider
+                    .CreateProtector("IOTSnap.Hmi.SetupFinalize.v1")
+                    .Unprotect(token);
+            }
+            catch
+            {
+                return Results.LocalRedirect("/setup");
+            }
+
+            var parts = payload.Split('|', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length != 2
+                || !long.TryParse(parts[1], out var issuedUnixSeconds)
+                || DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeSeconds(issuedUnixSeconds) > TimeSpan.FromMinutes(10))
+            {
+                return Results.LocalRedirect("/setup");
+            }
+
+            await using var db = await dbContextFactory.CreateDbContextAsync(httpContext.RequestAborted);
+            var user = await db.LocalUsers
+                .AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Username == parts[0] && x.IsEnabled, httpContext.RequestAborted);
+
+            if (user is null)
+            {
+                return Results.LocalRedirect("/setup");
+            }
+
+            await httpContext.SignInAsync(
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                CreatePrincipal(user));
+
+            return Results.LocalRedirect("/");
+        }).AllowAnonymous();
+
         app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
-        app.MapGet("/readyz", async (IDbContextFactory<HmiDbContext> dbContextFactory, CancellationToken cancellationToken) =>
+        app.MapGet("/readyz", async (IDbContextFactory<HmiDbContext> dbContextFactory, IOpcUaRuntime runtime, CancellationToken cancellationToken) =>
         {
             await using var db = await dbContextFactory.CreateDbContextAsync(cancellationToken);
             var userCount = await db.LocalUsers.CountAsync(cancellationToken);
             var profileCount = await db.OpcUaConnectionProfiles.CountAsync(cancellationToken);
-            return Results.Ok(new { status = "ready", userCount, profileCount });
+            var runtimeStatus = await runtime.GetStatusAsync(cancellationToken);
+            return Results.Json(
+                new { status = runtimeStatus.IsConnected ? "ready" : "degraded", userCount, profileCount, runtime = runtimeStatus.Detail },
+                statusCode: runtimeStatus.IsConnected || profileCount == 0 ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
         });
 
         app.MapDesignerApi();
@@ -202,18 +287,8 @@ public class Program
                     new OpcUaNodeMapping
                     {
                         OpcUaConnectionProfileId = profile.Id,
-                        DisplayName = "Tank Level",
-                        NodeId = "ns=2;s=Plant.Tank.Level",
-                        Area = "Process",
-                        DataType = "Double",
-                        SamplingIntervalMs = 1000,
-                        IsWritable = false
-                    },
-                    new OpcUaNodeMapping
-                    {
-                        OpcUaConnectionProfileId = profile.Id,
-                        DisplayName = "Line Speed",
-                        NodeId = "ns=2;s=Plant.Line.Speed",
+                        DisplayName = "Process Value",
+                        NodeId = "ns=3;s=FastUInt1",
                         Area = "Process",
                         DataType = "Double",
                         SamplingIntervalMs = 1000,
@@ -223,7 +298,7 @@ public class Program
                     {
                         OpcUaConnectionProfileId = profile.Id,
                         DisplayName = "Start Command",
-                        NodeId = "ns=2;s=Plant.Line.Start",
+                        NodeId = "ns=3;s=Plant.Line.Start",
                         Area = "Commands",
                         DataType = "Boolean",
                         SamplingIntervalMs = 250,
@@ -240,7 +315,12 @@ public class Program
                 .OrderBy(x => x.Id)
                 .FirstOrDefaultAsync();
 
-            var primaryNodeId = primaryNode?.NodeId ?? "ns=2;s=Demo.Static.Scalar.Double";
+            var primaryNodeId = primaryNode?.NodeId ?? "ns=3;s=FastUInt1";
+            var commandNode = await db.OpcUaNodeMappings
+                .AsNoTracking()
+                .OrderBy(x => x.Id)
+                .FirstOrDefaultAsync(x => x.IsWritable);
+            var commandNodeId = commandNode?.NodeId ?? "ns=3;s=Plant.Line.Start";
             var displayName = string.IsNullOrWhiteSpace(primaryNode?.DisplayName)
                 ? "Live Process Value"
                 : primaryNode.DisplayName;
@@ -314,7 +394,7 @@ public class Program
                         Width = 220,
                         Height = 140,
                         ZIndex = 3,
-                        PropertiesJson = "{\"property\":\"Action\"}",
+                        PropertiesJson = "{\"property\":\"Action\",\"commandValue\":\"true\"}",
                         UpdatedUtc = now,
                         Bindings =
                         {
@@ -322,7 +402,8 @@ public class Program
                             {
                                 BindingRole = "Action",
                                 SourceType = "OpcTag",
-                                SourceKey = primaryNodeId,
+                                SourceKey = commandNodeId,
+                                WriteRequiresConfirm = true,
                                 MinRole = HmiRoles.Operator,
                                 UpdatedUtc = now
                             }
@@ -380,6 +461,7 @@ public class Program
     private static bool IsSetupBypassPath(PathString path)
     {
         if (path.StartsWithSegments("/_framework")
+            || path.StartsWithSegments("/_blazor")
             || path.StartsWithSegments("/_content")
             || path.StartsWithSegments("/favicon.ico")
             || path.StartsWithSegments("/app.css")
@@ -409,5 +491,19 @@ public class Program
         }
 
         return returnUrl;
+    }
+
+    private static ClaimsPrincipal CreatePrincipal(LocalUser user)
+    {
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new(ClaimTypes.Name, user.Username),
+            new(ClaimTypes.GivenName, user.DisplayName),
+            new(ClaimTypes.Role, user.Role)
+        };
+
+        return new ClaimsPrincipal(
+            new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme));
     }
 }

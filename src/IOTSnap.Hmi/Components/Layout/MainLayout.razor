@@ -1,6 +1,7 @@
 @inherits LayoutComponentBase
 
 <div class="hmi-shell">
+    <InteractiveReadyMarker />
     <header class="hmi-header">
         <div>
             <div class="hmi-kicker">IOTSnap HMI</div>
@@ -18,8 +19,9 @@
                         <a href="/designer">Designer</a>
                         <a href="/settings">Settings</a>
                         <a href="/comms">Communications</a>
-                        <a href="/runtime/main">Runtime</a>
+                        <a href="/runtime">Runtime</a>
                         <a href="/users">Users</a>
+                        <a href="/audit">Audit</a>
                     </nav>
                     <form method="post" action="/logout">
                         <button class="hmi-ghost-button" type="submit">Sign Out</button>

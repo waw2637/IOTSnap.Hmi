@@ -1,149 +1,974 @@
 @page "/setup"
 @attribute [AllowAnonymous]
+@using System.Collections.Concurrent
+@using System.Net.Sockets
+@using Microsoft.AspNetCore.DataProtection
 @using Microsoft.AspNetCore.Identity
 @inject IDbContextFactory<HmiDbContext> DbContextFactory
 @inject IPasswordHasher<LocalUser> PasswordHasher
+@inject IOpcUaDiscovery OpcUaDiscovery
+@inject IDataProtectionProvider DataProtectionProvider
 @inject NavigationManager NavigationManager
 
 <PageTitle>Initial Setup</PageTitle>
 
-<section class="page-header">
-    <div>
-        <div class="hmi-kicker">First Run</div>
-        <h2>Set up your local administrator</h2>
-    </div>
-    <p>Create the first administrator account and optionally seed a PLC endpoint for the comms experience.</p>
-</section>
+<MudContainer MaxWidth="MaxWidth.False" Class="setup-page">
+    <MudGrid Spacing="4">
+        <MudItem xs="12" lg="4">
+            <MudPaper Class="setup-progress-rail" Elevation="0">
+                <MudText Class="hmi-kicker">First Run</MudText>
+                <MudText Typo="Typo.h3" Class="setup-title">Bring the HMI online</MudText>
+                <MudText Class="setup-subtitle">
+                    The setup flow walks through local admin creation first, then OPC UA connectivity and standards-based tag import through the server browse tree.
+                </MudText>
 
-@if (!string.IsNullOrWhiteSpace(_message))
-{
-    <div class="notice-banner @(_messageIsError ? "notice-banner-error" : string.Empty)">
-        @_message
-    </div>
-}
+                <div class="setup-step-stack">
+                    @foreach (var stepCard in _stepCards)
+                    {
+                        <MudPaper Class="@GetStepCardClass(stepCard.Step)" Elevation="0">
+                            <MudAvatar Size="Size.Large" Variant="Variant.Filled" Color="@GetStepColor(stepCard.Step)">
+                                @stepCard.Number
+                            </MudAvatar>
+                            <div>
+                                <MudText Typo="Typo.subtitle1">@stepCard.Title</MudText>
+                                <MudText Typo="Typo.body2">@stepCard.Description</MudText>
+                            </div>
+                        </MudPaper>
+                    }
+                </div>
 
-<section class="panel-card">
-    <div class="panel-label">Admin Account</div>
-    <p>Use these values to unlock the designer, communications, and runtime pages for your local deployment.</p>
-    <div class="hmi-form-grid hmi-form-grid-3">
-        <label>
-            <span>Username</span>
-            <input @bind="_username" maxlength="64" />
-        </label>
-        <label>
-            <span>Display Name</span>
-            <input @bind="_displayName" maxlength="128" />
-        </label>
-        <label>
-            <span>OPC UA Endpoint (optional)</span>
-            <input @bind="_endpointUrl" maxlength="512" placeholder="opc.tcp://127.0.0.1:4840" />
-        </label>
-    </div>
+                <MudPaper Class="setup-brand-panel" Elevation="0">
+                    <MudText Typo="Typo.overline">Industrial Operations Portal</MudText>
+                    <MudText Typo="Typo.h5">WAV-AC setup shell</MudText>
+                    <MudText Typo="Typo.body2">
+                        Using the same MudBlazor palette and typography as the live WAV-AC dashboard so first-run configuration feels like the rest of the platform.
+                    </MudText>
+                </MudPaper>
+            </MudPaper>
+        </MudItem>
 
-    <div class="hmi-form-grid hmi-form-grid-2">
-        <label>
-            <span>Password</span>
-            <input type="password" @bind="_password" />
-        </label>
-        <label>
-            <span>Confirm Password</span>
-            <input type="password" @bind="_confirmPassword" />
-        </label>
-    </div>
+        <MudItem xs="12" lg="8">
+            <MudPaper Class="setup-main-card" Elevation="0">
+                @if (!string.IsNullOrWhiteSpace(_message))
+                {
+                    <MudAlert Severity="@(_messageIsError ? Severity.Error : Severity.Success)" Dense="true" Variant="Variant.Filled" Class="setup-alert">
+                        @_message
+                    </MudAlert>
+                }
 
-    <div class="button-row">
-        <button class="hmi-primary-button" @onclick="CompleteSetupAsync">Complete Setup</button>
-    </div>
-</section>
+                @if (_step == SetupStep.Admin)
+                {
+                    <MudCard Class="setup-section-card">
+                        <MudCardContent>
+                            <MudText Typo="Typo.overline" Class="panel-label">Administrator</MudText>
+                            <MudText Typo="Typo.h5">Create the local admin account</MudText>
+                            <MudText Class="setup-copy">
+                                Create the first local account that will manage users, comms, screens, and runtime permissions.
+                            </MudText>
 
-<section class="stack-grid">
-    <article class="panel-card">
-        <div class="panel-label">What happens next</div>
-        <ul class="diag-list">
-            <li class="diag-item">You will be redirected to the sign-in screen with your new administrator account.</li>
-            <li class="diag-item">The communications page can then be used to connect to OPC UA or review the seeded demo profile.</li>
-            <li class="diag-item">The designer and runtime pages become available once you are signed in.</li>
-        </ul>
-    </article>
-</section>
+                            <MudGrid Spacing="3">
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_adminDraft.Username" Label="Username" Immediate="true" MaxLength="64" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_adminDraft.DisplayName" Label="Display Name" Immediate="true" MaxLength="128" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_adminDraft.Password" Label="Password" Immediate="true" InputType="InputType.Password" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_adminDraft.ConfirmPassword" Label="Confirm Password" Immediate="true" InputType="InputType.Password" Variant="Variant.Outlined" />
+                                </MudItem>
+                            </MudGrid>
+                        </MudCardContent>
+                        <MudCardActions Class="setup-actions">
+                            <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="ContinueToOpcAsync">Continue to OPC Setup</MudButton>
+                        </MudCardActions>
+                    </MudCard>
+                }
+                else if (_step == SetupStep.Opc)
+                {
+                    <MudCard Class="setup-section-card">
+                        <MudCardContent>
+                            <MudText Typo="Typo.overline" Class="panel-label">OPC Setup Mode</MudText>
+                            <MudText Typo="Typo.h5">Choose how to discover the server</MudText>
+                            <MudText Class="setup-copy">
+                                Choose whether to scan a subnet for reachable OPC UA servers or enter the endpoint details manually.
+                            </MudText>
+
+                            <MudButtonGroup Variant="Variant.Outlined" Color="Color.Primary" Class="setup-mode-group">
+                                <MudButton Variant="@GetModeVariant(SetupOpcMode.Scan)" OnClick="@(() => SelectOpcMode(SetupOpcMode.Scan))">Scan Network</MudButton>
+                                <MudButton Variant="@GetModeVariant(SetupOpcMode.Manual)" OnClick="@(() => SelectOpcMode(SetupOpcMode.Manual))">Enter Manually</MudButton>
+                            </MudButtonGroup>
+                        </MudCardContent>
+                    </MudCard>
+
+                    @if (_opcMode == SetupOpcMode.Scan)
+                    {
+                        <MudCard Class="setup-section-card">
+                            <MudCardContent>
+                                <MudText Typo="Typo.overline" Class="panel-label">Network Scan</MudText>
+                                <MudText Typo="Typo.h5">Scan for reachable OPC UA endpoints</MudText>
+                                <MudText Class="setup-copy">
+                                    Scan a host range on the selected subnet and port, then choose one of the discovered endpoints.
+                                </MudText>
+
+                                <MudGrid Spacing="3">
+                                    <MudItem xs="12" sm="6" lg="3">
+                                        <MudTextField @bind-Value="_scanSubnetPrefix" Label="Subnet Prefix" Immediate="true" MaxLength="32" Placeholder="192.168.1" Variant="Variant.Outlined" />
+                                    </MudItem>
+                                    <MudItem xs="12" sm="6" lg="3">
+                                        <MudNumericField T="int" @bind-Value="_scanHostStart" Label="Start Host" Min="1" Max="254" Immediate="true" Variant="Variant.Outlined" />
+                                    </MudItem>
+                                    <MudItem xs="12" sm="6" lg="3">
+                                        <MudNumericField T="int" @bind-Value="_scanHostEnd" Label="End Host" Min="1" Max="254" Immediate="true" Variant="Variant.Outlined" />
+                                    </MudItem>
+                                    <MudItem xs="12" sm="6" lg="3">
+                                        <MudNumericField T="int" @bind-Value="_scanPort" Label="Port" Min="1" Max="65535" Immediate="true" Variant="Variant.Outlined" />
+                                    </MudItem>
+                                </MudGrid>
+                            </MudCardContent>
+                            <MudCardActions Class="setup-actions">
+                                <MudButton Variant="Variant.Filled" Color="Color.Primary" Disabled="@_isScanningNetwork" OnClick="ScanNetworkAsync">Scan Network</MudButton>
+                                @if (_isScanningNetwork)
+                                {
+                                    <MudProgressCircular Indeterminate="true" Color="Color.Primary" Size="Size.Medium" />
+                                }
+                            </MudCardActions>
+                        </MudCard>
+
+                        @if (_scannedEndpoints.Count > 0)
+                        {
+                            <MudCard Class="setup-section-card">
+                                <MudCardContent>
+                                    <MudText Typo="Typo.overline" Class="panel-label">Discovered Endpoints</MudText>
+                                    <MudTable Items="_scannedEndpoints" Hover="true" Dense="true" Breakpoint="Breakpoint.Md" RowClassFunc="GetEndpointRowClass">
+                                        <HeaderContent>
+                                            <MudTh>Endpoint</MudTh>
+                                            <MudTh>Server</MudTh>
+                                            <MudTh>Security</MudTh>
+                                            <MudTh>Auth</MudTh>
+                                            <MudTh>Actions</MudTh>
+                                        </HeaderContent>
+                                        <RowTemplate>
+                                            <MudTd DataLabel="Endpoint">@context.EndpointUrl</MudTd>
+                                            <MudTd DataLabel="Server">@context.ApplicationName</MudTd>
+                                            <MudTd DataLabel="Security">@context.SecurityMode / @context.SecurityPolicy</MudTd>
+                                            <MudTd DataLabel="Auth">@DescribeAuth(context)</MudTd>
+                                            <MudTd DataLabel="Actions">
+                                                <div class="setup-inline-actions">
+                                                    <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="@(() => SelectEndpoint(context))">Select</MudButton>
+                                                    <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="@(() => ApplyEndpoint(context))">Use Endpoint</MudButton>
+                                                </div>
+                                            </MudTd>
+                                        </RowTemplate>
+                                    </MudTable>
+                                </MudCardContent>
+                            </MudCard>
+                        }
+                    }
+
+                    <MudCard Class="setup-section-card">
+                        <MudCardContent>
+                            <MudText Typo="Typo.overline" Class="panel-label">Connection Profile</MudText>
+                            <MudText Typo="Typo.h5">Prepare the runtime connection</MudText>
+                            <MudText Class="setup-copy">
+                                Manual entry and scanned endpoints both feed the same setup profile. Tag import uses the OPC UA browse tree so you can start from the server namespace instead of typing node IDs by hand.
+                            </MudText>
+
+                            <MudGrid Spacing="3">
+                                <MudItem xs="12" md="4">
+                                    <MudTextField @bind-Value="_profileDraft.Name" Label="Profile Name" Immediate="true" MaxLength="128" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudTextField @bind-Value="_profileDraft.EndpointUrl" Label="Endpoint URL" Immediate="true" MaxLength="512" Placeholder="opc.tcp://192.168.1.26:4840" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudSelect T="string" @bind-Value="_profileDraft.AuthenticationMode" Label="Auth Mode" Variant="Variant.Outlined">
+                                        <MudSelectItem Value="@("Anonymous")">Anonymous</MudSelectItem>
+                                        <MudSelectItem Value="@("UsernamePassword")">UsernamePassword</MudSelectItem>
+                                    </MudSelect>
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudTextField @bind-Value="_profileDraft.SecurityPolicy" Label="Security Policy" Immediate="true" MaxLength="64" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudTextField @bind-Value="_profileDraft.SecurityMode" Label="Security Mode" Immediate="true" MaxLength="64" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudNumericField T="int" @bind-Value="_profileDraft.PublishingIntervalMs" Label="Publishing Interval (ms)" Min="100" Step="100" Immediate="true" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_profileDraft.Username" Label="Username" Immediate="true" MaxLength="128" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_profileDraft.Password" Label="Password" Immediate="true" InputType="InputType.Password" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudTextField @bind-Value="_browseRootPath" Label="Browse Root" Immediate="true" MaxLength="256" Placeholder="Objects" Variant="Variant.Outlined" />
+                                </MudItem>
+                                <MudItem xs="12" md="6">
+                                    <MudNumericField T="int" @bind-Value="_browseDepth" Label="Browse Depth" Min="1" Max="12" Immediate="true" Variant="Variant.Outlined" />
+                                </MudItem>
+                            </MudGrid>
+
+                            <div class="setup-checkbox-row">
+                                <MudCheckBox T="bool" @bind-Value="_profileDraft.UseSecurity" Label="Use Security" Color="Color.Primary" />
+                                <MudCheckBox T="bool" @bind-Value="_profileDraft.Enabled" Label="Enable Profile Immediately" Color="Color.Primary" />
+                            </div>
+                        </MudCardContent>
+                        <MudCardActions Class="setup-actions">
+                            <MudButton Variant="Variant.Filled" Color="Color.Primary" Disabled="@_isBrowsingTags" OnClick="BrowseTagsAsync">Browse and Import Tags</MudButton>
+                            <MudButton Variant="Variant.Outlined" Color="Color.Primary" OnClick="SkipOpcSetup">Skip for Now</MudButton>
+                            @if (_isBrowsingTags)
+                            {
+                                <MudProgressCircular Indeterminate="true" Color="Color.Primary" Size="Size.Medium" />
+                            }
+                        </MudCardActions>
+                    </MudCard>
+
+                    @if (_discoveredTags.Count > 0)
+                    {
+                        <MudCard Class="setup-section-card">
+                            <MudCardContent>
+                                <div class="setup-table-header">
+                                    <div>
+                                        <MudText Typo="Typo.overline" Class="panel-label">Tag Import</MudText>
+                                        <MudText Typo="Typo.h5">Select the browsed variables to import</MudText>
+                                        <MudText Class="setup-copy">This uses OPC UA browse results as the import source.</MudText>
+                                    </div>
+                                    <MudChip T="string" Color="Color.Primary" Variant="Variant.Filled">@($"{_selectedTagNodeIds.Count} selected")</MudChip>
+                                </div>
+
+                                <div class="setup-inline-actions">
+                                    <MudButton Variant="Variant.Outlined" Color="Color.Primary" OnClick="SelectAllTags">Select All</MudButton>
+                                    <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="ClearSelectedTags">Clear Selection</MudButton>
+                                </div>
+
+                                <MudTable Items="_discoveredTags" Hover="true" Dense="true" Breakpoint="Breakpoint.Md">
+                                    <HeaderContent>
+                                        <MudTh>Import</MudTh>
+                                        <MudTh>Name</MudTh>
+                                        <MudTh>NodeId</MudTh>
+                                        <MudTh>Path</MudTh>
+                                        <MudTh>Type</MudTh>
+                                        <MudTh>Writable</MudTh>
+                                    </HeaderContent>
+                                    <RowTemplate>
+                                        <MudTd DataLabel="Import">
+                                            <MudCheckBox T="bool"
+                                                Value="@_selectedTagNodeIds.Contains(context.NodeId)"
+                                                ValueChanged="@(value => ToggleTagSelection(context.NodeId, value))"
+                                                Color="Color.Primary" />
+                                        </MudTd>
+                                        <MudTd DataLabel="Name">@context.DisplayName</MudTd>
+                                        <MudTd DataLabel="NodeId">@context.NodeId</MudTd>
+                                        <MudTd DataLabel="Path">@context.BrowsePath</MudTd>
+                                        <MudTd DataLabel="Type">@context.DataType</MudTd>
+                                        <MudTd DataLabel="Writable">@(context.IsWritable ? "Yes" : "No")</MudTd>
+                                    </RowTemplate>
+                                </MudTable>
+                            </MudCardContent>
+                        </MudCard>
+                    }
+
+                    <div class="setup-actions">
+                        <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="GoBackToAdmin">Back</MudButton>
+                        <MudButton Variant="Variant.Filled" Color="Color.Primary" OnClick="ReviewFinishAsync">Review and Finish</MudButton>
+                    </div>
+                }
+                else
+                {
+                    <MudCard Class="setup-section-card">
+                        <MudCardContent>
+                            <MudText Typo="Typo.overline" Class="panel-label">Ready to Finish</MudText>
+                            <MudText Typo="Typo.h5">Review the launch summary</MudText>
+
+                            <MudGrid Spacing="3" Class="setup-summary-grid">
+                                <MudItem xs="12" md="4">
+                                    <MudPaper Class="setup-summary-card" Elevation="0">
+                                        <MudText Typo="Typo.overline" Class="panel-label">Administrator</MudText>
+                                        <MudText Typo="Typo.h6">@_adminDraft.Username</MudText>
+                                        <MudText Typo="Typo.body2">@_adminDraft.DisplayName</MudText>
+                                    </MudPaper>
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudPaper Class="setup-summary-card" Elevation="0">
+                                        <MudText Typo="Typo.overline" Class="panel-label">OPC Endpoint</MudText>
+                                        <MudText Typo="Typo.h6">@(_skipOpcSetup ? "Skipped for now" : _profileDraft.EndpointUrl)</MudText>
+                                        <MudText Typo="Typo.body2">@(_skipOpcSetup ? "You can configure communications later from the Comms page." : $"{_profileDraft.SecurityMode} / {_profileDraft.SecurityPolicy}")</MudText>
+                                    </MudPaper>
+                                </MudItem>
+                                <MudItem xs="12" md="4">
+                                    <MudPaper Class="setup-summary-card" Elevation="0">
+                                        <MudText Typo="Typo.overline" Class="panel-label">Tag Import</MudText>
+                                        <MudText Typo="Typo.h4">@(_skipOpcSetup ? 0 : _selectedTagNodeIds.Count)</MudText>
+                                        <MudText Typo="Typo.body2">@(_skipOpcSetup ? "No tags imported during setup." : "Selected browsed tags will be saved as node mappings.")</MudText>
+                                    </MudPaper>
+                                </MudItem>
+                            </MudGrid>
+
+                            <MudList T="string" Dense="true" Class="setup-checklist">
+                                <MudListItem T="string" Icon="@Icons.Material.Filled.CheckCircle">Finishing setup creates the administrator account.</MudListItem>
+                                <MudListItem T="string" Icon="@Icons.Material.Filled.CheckCircle">If OPC was configured, the selected endpoint and tags are saved into the local database.</MudListItem>
+                                <MudListItem T="string" Icon="@Icons.Material.Filled.CheckCircle">The setup flow then signs you in and drops you on the HMI home screen.</MudListItem>
+                            </MudList>
+                        </MudCardContent>
+                        <MudCardActions Class="setup-actions">
+                            <MudButton Variant="Variant.Text" Color="Color.Primary" OnClick="GoBackToOpc">Back</MudButton>
+                            <MudButton Variant="Variant.Filled" Color="Color.Primary" Disabled="@_isSaving" OnClick="CompleteSetupAsync">Finish Setup</MudButton>
+                            @if (_isSaving)
+                            {
+                                <MudProgressCircular Indeterminate="true" Color="Color.Primary" Size="Size.Medium" />
+                            }
+                        </MudCardActions>
+                    </MudCard>
+                }
+            </MudPaper>
+        </MudItem>
+    </MudGrid>
+</MudContainer>
 
 @code {
-    private string _username = "admin";
-    private string _displayName = "Local Administrator";
-    private string _password = string.Empty;
-    private string _confirmPassword = string.Empty;
-    private string _endpointUrl = string.Empty;
+    private readonly AdminDraft _adminDraft = new();
+    private readonly ProfileDraft _profileDraft = new();
+    private readonly HashSet<string> _selectedTagNodeIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly StepCard[] _stepCards =
+    [
+        new(SetupStep.Admin, "1", "Admin", "Create the first local administrator."),
+        new(SetupStep.Opc, "2", "OPC UA", "Scan or enter a server, then import tags."),
+        new(SetupStep.Finish, "3", "Launch", "Save setup and go straight into the HMI.")
+    ];
+    private List<OpcUaDiscoveredEndpoint> _scannedEndpoints = new();
+    private List<OpcUaDiscoveredTag> _discoveredTags = new();
+    private OpcUaDiscoveredEndpoint? _selectedEndpoint;
+    private string _scanSubnetPrefix = "192.168.1";
+    private int _scanHostStart = 1;
+    private int _scanHostEnd = 32;
+    private int _scanPort = 4840;
+    private int _browseDepth = 6;
+    private string? _browseRootPath = "Objects";
     private string? _message;
     private bool _messageIsError;
+    private bool _isScanningNetwork;
+    private bool _isBrowsingTags;
+    private bool _isSaving;
+    private bool _skipOpcSetup;
+    private SetupStep _step = SetupStep.Admin;
+    private SetupOpcMode _opcMode = SetupOpcMode.Manual;
 
     protected override async Task OnInitializedAsync()
     {
         await using var db = await DbContextFactory.CreateDbContextAsync();
-        var hasUsers = await db.LocalUsers.AnyAsync();
-        if (hasUsers)
-        {
-            NavigationManager.NavigateTo("/", true);
-        }
-    }
-
-    private async Task CompleteSetupAsync()
-    {
-        var username = _username.Trim();
-        var displayName = _displayName.Trim();
-
-        if (string.IsNullOrWhiteSpace(username)
-            || string.IsNullOrWhiteSpace(_password)
-            || string.IsNullOrWhiteSpace(_confirmPassword))
-        {
-            SetMessage("Username, password, and confirmation are required.", true);
-            return;
-        }
-
-        if (!string.Equals(_password, _confirmPassword, StringComparison.Ordinal))
-        {
-            SetMessage("Passwords do not match.", true);
-            return;
-        }
-
-        await using var db = await DbContextFactory.CreateDbContextAsync();
-
         if (await db.LocalUsers.AnyAsync())
         {
             NavigationManager.NavigateTo("/", true);
             return;
         }
 
-        var admin = new LocalUser
-        {
-            Username = username,
-            DisplayName = string.IsNullOrWhiteSpace(displayName) ? username : displayName,
-            Role = HmiRoles.Admin,
-            IsEnabled = true
-        };
-        admin.PasswordHash = PasswordHasher.HashPassword(admin, _password);
-        db.LocalUsers.Add(admin);
+        var seededProfile = await db.OpcUaConnectionProfiles
+            .AsNoTracking()
+            .OrderByDescending(x => x.Id)
+            .FirstOrDefaultAsync();
 
-        var endpoint = _endpointUrl.Trim();
-        if (!string.IsNullOrWhiteSpace(endpoint)
-            && Uri.TryCreate(endpoint, UriKind.Absolute, out var endpointUri)
-            && string.Equals(endpointUri.Scheme, "opc.tcp", StringComparison.OrdinalIgnoreCase)
-            && !await db.OpcUaConnectionProfiles.AnyAsync())
+        if (seededProfile is not null)
         {
-            db.OpcUaConnectionProfiles.Add(new OpcUaConnectionProfile
-            {
-                Name = "Primary PLC",
-                EndpointUrl = endpoint,
-                AuthenticationMode = "Anonymous"
-            });
+            _profileDraft.Name = seededProfile.Name;
+            _profileDraft.EndpointUrl = seededProfile.EndpointUrl;
+            _profileDraft.Enabled = seededProfile.Enabled;
+            _profileDraft.UseSecurity = seededProfile.UseSecurity;
+            _profileDraft.SecurityPolicy = seededProfile.SecurityPolicy;
+            _profileDraft.SecurityMode = seededProfile.SecurityMode;
+            _profileDraft.AuthenticationMode = seededProfile.AuthenticationMode;
+            _profileDraft.Username = seededProfile.Username;
+            _profileDraft.PublishingIntervalMs = seededProfile.PublishingIntervalMs;
+        }
+    }
+
+    private Task ContinueToOpcAsync()
+    {
+        if (ValidateAdminStep() is { } error)
+        {
+            SetMessage(error, true);
+            return Task.CompletedTask;
         }
 
-        await db.SaveChangesAsync();
-        NavigationManager.NavigateTo("/login?configured=1", true);
+        _step = SetupStep.Opc;
+        SetMessage("Administrator details look good. Next, choose how you want to bring in your OPC UA server and tags.", false);
+        return Task.CompletedTask;
     }
+
+    private void SelectOpcMode(SetupOpcMode mode)
+    {
+        _opcMode = mode;
+        SetMessage(mode == SetupOpcMode.Scan
+            ? "Network scan mode selected. Scan a host range and then choose the endpoint you want."
+            : "Manual mode selected. Enter the endpoint directly and browse tags from the server namespace.", false);
+    }
+
+    private async Task ScanNetworkAsync()
+    {
+        if (ValidateScanInputs() is { } error)
+        {
+            SetMessage(error, true);
+            return;
+        }
+
+        _isScanningNetwork = true;
+        _scannedEndpoints.Clear();
+        _selectedEndpoint = null;
+
+        try
+        {
+            var urls = Enumerable.Range(_scanHostStart, _scanHostEnd - _scanHostStart + 1)
+                .Select(host => $"opc.tcp://{_scanSubnetPrefix.Trim()}.{host}:{_scanPort}")
+                .ToList();
+            var results = new ConcurrentBag<OpcUaDiscoveredEndpoint>();
+            using var throttler = new SemaphoreSlim(8);
+            var tasks = urls.Select(async url =>
+            {
+                await throttler.WaitAsync();
+                try
+                {
+                    if (!await IsTcpEndpointReachableAsync(url))
+                    {
+                        return;
+                    }
+
+                    foreach (var endpoint in await OpcUaDiscovery.DiscoverEndpointsAsync(url))
+                    {
+                        results.Add(endpoint);
+                    }
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    throttler.Release();
+                }
+            });
+
+            await Task.WhenAll(tasks);
+
+            _scannedEndpoints = results
+                .GroupBy(x => x.EndpointUrl, StringComparer.OrdinalIgnoreCase)
+                .Select(x => x.OrderByDescending(endpoint => endpoint.SecurityLevel).First())
+                .OrderBy(x => x.EndpointUrl, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (_scannedEndpoints.Count == 0)
+            {
+                SetMessage("The scan completed, but no reachable OPC UA endpoints were discovered in that host range.", true);
+                return;
+            }
+
+            _selectedEndpoint = _scannedEndpoints[0];
+            ApplyEndpoint(_selectedEndpoint);
+            SetMessage($"Scan complete. Found {_scannedEndpoints.Count} endpoint(s).", false);
+        }
+        finally
+        {
+            _isScanningNetwork = false;
+        }
+    }
+
+    private async Task BrowseTagsAsync()
+    {
+        if (ValidateOpcDraft(requireEndpoint: true) is { } error)
+        {
+            SetMessage(error, true);
+            return;
+        }
+
+        _isBrowsingTags = true;
+        _skipOpcSetup = false;
+
+        try
+        {
+            await AlignProfileToDiscoveredEndpointAsync();
+
+            var request = new OpcUaBrowseRequest(
+                _profileDraft.EndpointUrl.Trim(),
+                _profileDraft.UseSecurity,
+                _profileDraft.SecurityPolicy.Trim(),
+                _profileDraft.SecurityMode.Trim(),
+                _profileDraft.AuthenticationMode.Trim(),
+                string.IsNullOrWhiteSpace(_profileDraft.Username) ? null : _profileDraft.Username.Trim(),
+                string.IsNullOrWhiteSpace(_profileDraft.Password) ? null : _profileDraft.Password,
+                Math.Clamp(_browseDepth, 1, 12),
+                250,
+                string.IsNullOrWhiteSpace(_browseRootPath) ? null : _browseRootPath.Trim());
+
+            _discoveredTags = (await OpcUaDiscovery.BrowseTagsAsync(request)).ToList();
+            _selectedTagNodeIds.Clear();
+            foreach (var tag in _discoveredTags)
+            {
+                _selectedTagNodeIds.Add(tag.NodeId);
+            }
+
+            SetMessage(_discoveredTags.Count == 0
+                ? "The endpoint connected successfully, but no browsable variable tags were returned for the selected root."
+                : $"Browsed {_discoveredTags.Count} tag(s). All are selected for import by default.", _discoveredTags.Count == 0);
+        }
+        catch (Exception ex)
+        {
+            _discoveredTags.Clear();
+            _selectedTagNodeIds.Clear();
+            SetMessage($"Tag browse failed: {ex.Message}", true);
+        }
+        finally
+        {
+            _isBrowsingTags = false;
+        }
+    }
+
+    private async Task AlignProfileToDiscoveredEndpointAsync()
+    {
+        var discoveredEndpoints = (await OpcUaDiscovery.DiscoverEndpointsAsync(_profileDraft.EndpointUrl.Trim()))
+            .ToList();
+
+        if (discoveredEndpoints.Count == 0)
+        {
+            return;
+        }
+
+        var preferredEndpoint = discoveredEndpoints
+            .Where(SupportsCurrentAuthenticationMode)
+            .OrderByDescending(endpoint => endpoint.UseSecurity)
+            .ThenByDescending(endpoint => endpoint.SecurityLevel)
+            .FirstOrDefault()
+            ?? discoveredEndpoints
+                .OrderByDescending(endpoint => endpoint.UseSecurity)
+                .ThenByDescending(endpoint => endpoint.SecurityLevel)
+                .First();
+
+        _selectedEndpoint = preferredEndpoint;
+        ApplyEndpoint(preferredEndpoint);
+    }
+
+    private Task ReviewFinishAsync()
+    {
+        if (!_skipOpcSetup && ValidateOpcDraft(requireEndpoint: false) is { } error)
+        {
+            SetMessage(error, true);
+            return Task.CompletedTask;
+        }
+
+        _step = SetupStep.Finish;
+        SetMessage("Setup is ready to finish. Review the summary and launch into the HMI when you’re happy with it.", false);
+        return Task.CompletedTask;
+    }
+
+    private async Task CompleteSetupAsync()
+    {
+        if (ValidateAdminStep() is { } adminError)
+        {
+            SetMessage(adminError, true);
+            _step = SetupStep.Admin;
+            return;
+        }
+
+        if (!_skipOpcSetup && ValidateOpcDraft(requireEndpoint: false) is { } opcError)
+        {
+            SetMessage(opcError, true);
+            _step = SetupStep.Opc;
+            return;
+        }
+
+        _isSaving = true;
+
+        try
+        {
+            await using var db = await DbContextFactory.CreateDbContextAsync();
+            if (await db.LocalUsers.AnyAsync())
+            {
+                NavigationManager.NavigateTo("/", true);
+                return;
+            }
+
+            var username = _adminDraft.Username.Trim();
+            var displayName = string.IsNullOrWhiteSpace(_adminDraft.DisplayName) ? username : _adminDraft.DisplayName.Trim();
+            var now = DateTimeOffset.UtcNow;
+            var importedTags = _discoveredTags
+                .Where(tag => _selectedTagNodeIds.Contains(tag.NodeId))
+                .ToList();
+
+            var admin = new LocalUser
+            {
+                Username = username,
+                DisplayName = displayName,
+                Role = HmiRoles.Admin,
+                IsEnabled = true,
+                CreatedUtc = now
+            };
+            admin.PasswordHash = PasswordHasher.HashPassword(admin, _adminDraft.Password);
+            db.LocalUsers.Add(admin);
+
+            var persistedProfile = await db.OpcUaConnectionProfiles
+                .Include(x => x.NodeMappings)
+                .OrderBy(x => x.Id)
+                .FirstOrDefaultAsync();
+
+            if (!_skipOpcSetup)
+            {
+                persistedProfile ??= new OpcUaConnectionProfile();
+                persistedProfile.Name = _profileDraft.Name.Trim();
+                persistedProfile.EndpointUrl = _profileDraft.EndpointUrl.Trim();
+                persistedProfile.Enabled = _profileDraft.Enabled;
+                persistedProfile.UseSecurity = _profileDraft.UseSecurity;
+                persistedProfile.SecurityPolicy = _profileDraft.SecurityPolicy.Trim();
+                persistedProfile.SecurityMode = _profileDraft.SecurityMode.Trim();
+                persistedProfile.AuthenticationMode = _profileDraft.AuthenticationMode.Trim();
+                persistedProfile.Username = string.IsNullOrWhiteSpace(_profileDraft.Username) ? null : _profileDraft.Username.Trim();
+                persistedProfile.PublishingIntervalMs = Math.Max(100, _profileDraft.PublishingIntervalMs);
+                persistedProfile.UpdatedUtc = now;
+
+                if (!string.IsNullOrWhiteSpace(_profileDraft.Password))
+                {
+                    persistedProfile.ProtectedPassword = DataProtectionProvider
+                        .CreateProtector("IOTSnap.Hmi.OpcUaProfilePassword.v1")
+                        .Protect(_profileDraft.Password);
+                    persistedProfile.Password = null;
+                }
+                else
+                {
+                    persistedProfile.ProtectedPassword = null;
+                    persistedProfile.Password = null;
+                }
+
+                if (persistedProfile.Id == 0)
+                {
+                    db.OpcUaConnectionProfiles.Add(persistedProfile);
+                }
+
+                db.OpcUaNodeMappings.RemoveRange(persistedProfile.NodeMappings);
+                persistedProfile.NodeMappings.Clear();
+
+                foreach (var tag in importedTags)
+                {
+                    persistedProfile.NodeMappings.Add(new OpcUaNodeMapping
+                    {
+                        DisplayName = tag.DisplayName,
+                        NodeId = tag.NodeId,
+                        Area = DeriveArea(tag.BrowsePath),
+                        DataType = string.IsNullOrWhiteSpace(tag.DataType) ? "Auto" : tag.DataType,
+                        SamplingIntervalMs = Math.Max(100, _profileDraft.PublishingIntervalMs),
+                        IsWritable = tag.IsWritable
+                    });
+                }
+
+                await RetargetDefaultRuntimeScreenAsync(db, importedTags, now);
+            }
+            else
+            {
+                await DisableSeededOpcProfileAsync(db, now);
+            }
+
+            await db.SaveChangesAsync();
+
+            var token = CreateSetupFinalizeToken(username, now);
+            NavigationManager.NavigateTo($"/setup/finalize?token={Uri.EscapeDataString(token)}", true);
+        }
+        finally
+        {
+            _isSaving = false;
+        }
+    }
+
+    private void ApplyEndpoint(OpcUaDiscoveredEndpoint endpoint)
+    {
+        _selectedEndpoint = endpoint;
+        _skipOpcSetup = false;
+        _profileDraft.EndpointUrl = endpoint.EndpointUrl;
+        _profileDraft.UseSecurity = endpoint.UseSecurity;
+        _profileDraft.SecurityPolicy = endpoint.SecurityPolicy;
+        _profileDraft.SecurityMode = endpoint.SecurityMode;
+        _profileDraft.AuthenticationMode = endpoint.SupportsAnonymous ? "Anonymous" : "UsernamePassword";
+    }
+
+    private void SelectEndpoint(OpcUaDiscoveredEndpoint endpoint)
+    {
+        _selectedEndpoint = endpoint;
+        SetMessage($"Selected {endpoint.EndpointUrl}. Apply it to load the connection details into the profile.", false);
+    }
+
+    private void SkipOpcSetup()
+    {
+        _skipOpcSetup = true;
+        _discoveredTags.Clear();
+        _selectedTagNodeIds.Clear();
+        SetMessage("OPC setup will be skipped for now. You can return to the Communications page later to configure discovery, trust, and mappings.", false);
+    }
+
+    private void ToggleTagSelection(string nodeId, bool isSelected)
+    {
+        if (isSelected)
+        {
+            _selectedTagNodeIds.Add(nodeId);
+        }
+        else
+        {
+            _selectedTagNodeIds.Remove(nodeId);
+        }
+    }
+
+    private void SelectAllTags()
+    {
+        foreach (var tag in _discoveredTags)
+        {
+            _selectedTagNodeIds.Add(tag.NodeId);
+        }
+    }
+
+    private void ClearSelectedTags()
+    {
+        _selectedTagNodeIds.Clear();
+    }
+
+    private void GoBackToAdmin() => _step = SetupStep.Admin;
+
+    private void GoBackToOpc() => _step = SetupStep.Opc;
+
+    private string? ValidateAdminStep()
+    {
+        var username = _adminDraft.Username.Trim();
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(_adminDraft.Password) || string.IsNullOrWhiteSpace(_adminDraft.ConfirmPassword))
+        {
+            return "Username, password, and confirmation are required.";
+        }
+
+        if (!string.Equals(_adminDraft.Password, _adminDraft.ConfirmPassword, StringComparison.Ordinal))
+        {
+            return "Passwords do not match.";
+        }
+
+        return null;
+    }
+
+    private string? ValidateScanInputs()
+    {
+        var prefix = _scanSubnetPrefix.Trim();
+        var segments = prefix.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length != 3 || segments.Any(segment => !byte.TryParse(segment, out _)))
+        {
+            return "Subnet prefix must look like 192.168.1.";
+        }
+
+        if (_scanHostStart < 1 || _scanHostEnd > 254 || _scanHostEnd < _scanHostStart)
+        {
+            return "Host range must stay within 1-254 and the end host must be greater than or equal to the start host.";
+        }
+
+        if (_scanPort < 1 || _scanPort > 65535)
+        {
+            return "Port must be between 1 and 65535.";
+        }
+
+        return null;
+    }
+
+    private string? ValidateOpcDraft(bool requireEndpoint)
+    {
+        if (_skipOpcSetup)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(_profileDraft.Name))
+        {
+            return "Profile name is required.";
+        }
+
+        if (!requireEndpoint && string.IsNullOrWhiteSpace(_profileDraft.EndpointUrl))
+        {
+            return null;
+        }
+
+        if (!Uri.TryCreate(_profileDraft.EndpointUrl, UriKind.Absolute, out var endpointUri)
+            || !string.Equals(endpointUri.Scheme, "opc.tcp", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Endpoint URL must be an absolute opc.tcp URL.";
+        }
+
+        if (string.Equals(_profileDraft.AuthenticationMode, "UsernamePassword", StringComparison.OrdinalIgnoreCase)
+            && string.IsNullOrWhiteSpace(_profileDraft.Username))
+        {
+            return "A username is required when UsernamePassword authentication is selected.";
+        }
+
+        return null;
+    }
+
+    private bool SupportsCurrentAuthenticationMode(OpcUaDiscoveredEndpoint endpoint)
+        => string.Equals(_profileDraft.AuthenticationMode, "UsernamePassword", StringComparison.OrdinalIgnoreCase)
+            ? endpoint.SupportsUsernamePassword
+            : endpoint.SupportsAnonymous;
+
+    private async Task<bool> IsTcpEndpointReachableAsync(string endpointUrl)
+    {
+        var uri = new Uri(endpointUrl);
+        using var client = new TcpClient();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(600));
+        try
+        {
+            await client.ConnectAsync(uri.Host, uri.Port, cts.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private string CreateSetupFinalizeToken(string username, DateTimeOffset issuedUtc)
+    {
+        var protector = DataProtectionProvider.CreateProtector("IOTSnap.Hmi.SetupFinalize.v1");
+        return protector.Protect($"{username}|{issuedUtc.ToUnixTimeSeconds()}");
+    }
+
+    private static async Task RetargetDefaultRuntimeScreenAsync(HmiDbContext db, IReadOnlyList<OpcUaDiscoveredTag> importedTags, DateTimeOffset now)
+    {
+        if (importedTags.Count == 0)
+        {
+            return;
+        }
+
+        var screen = await db.HmiScreens
+            .Include(x => x.Widgets)
+                .ThenInclude(x => x.Bindings)
+            .FirstOrDefaultAsync(x => x.Slug == "main");
+
+        if (screen is null)
+        {
+            return;
+        }
+
+        var primaryTag = importedTags[0];
+        var writableTag = importedTags.FirstOrDefault(x => x.IsWritable) ?? primaryTag;
+
+        foreach (var widget in screen.Widgets)
+        {
+            switch (widget.Key)
+            {
+                case "pv-main":
+                    widget.Title = primaryTag.DisplayName;
+                    UpdateWidgetBinding(widget, "Text", primaryTag.NodeId, now);
+                    break;
+                case "state-main":
+                    UpdateWidgetBinding(widget, "Color", primaryTag.NodeId, now);
+                    break;
+                case "cmd-start":
+                    widget.Title = writableTag.DisplayName;
+                    UpdateWidgetBinding(widget, "Action", writableTag.NodeId, now);
+                    break;
+            }
+
+            widget.UpdatedUtc = now;
+        }
+
+        screen.UpdatedUtc = now;
+        screen.PublishedUtc = now;
+    }
+
+    private static void UpdateWidgetBinding(HmiWidget widget, string bindingRole, string nodeId, DateTimeOffset now)
+    {
+        var binding = widget.Bindings.FirstOrDefault(x => string.Equals(x.BindingRole, bindingRole, StringComparison.OrdinalIgnoreCase));
+        if (binding is null)
+        {
+            return;
+        }
+
+        binding.SourceKey = nodeId;
+        binding.UpdatedUtc = now;
+    }
+
+    private static async Task DisableSeededOpcProfileAsync(HmiDbContext db, DateTimeOffset now)
+    {
+        var profiles = await db.OpcUaConnectionProfiles
+            .Include(x => x.NodeMappings)
+            .ToListAsync();
+
+        foreach (var profile in profiles)
+        {
+            profile.Enabled = false;
+            profile.UpdatedUtc = now;
+        }
+    }
+
+    private string GetStepCardClass(SetupStep step)
+        => _step == step
+            ? "setup-step-card setup-step-card-active"
+            : _step > step
+                ? "setup-step-card setup-step-card-complete"
+                : "setup-step-card";
+
+    private Color GetStepColor(SetupStep step)
+        => _step == step
+            ? Color.Primary
+            : _step > step
+                ? Color.Success
+                : Color.Default;
+
+    private Variant GetModeVariant(SetupOpcMode mode)
+        => _opcMode == mode ? Variant.Filled : Variant.Outlined;
+
+    private string GetEndpointRowClass(OpcUaDiscoveredEndpoint endpoint, int index)
+        => ReferenceEquals(_selectedEndpoint, endpoint) ? "setup-selected-row" : string.Empty;
 
     private void SetMessage(string message, bool isError)
     {
         _message = message;
         _messageIsError = isError;
     }
+
+    private static string DescribeAuth(OpcUaDiscoveredEndpoint endpoint)
+        => endpoint.SupportsAnonymous && endpoint.SupportsUsernamePassword
+            ? "Anonymous, UsernamePassword"
+            : endpoint.SupportsUsernamePassword
+                ? "UsernamePassword"
+                : "Anonymous";
+
+    private static string DeriveArea(string browsePath)
+    {
+        var segments = browsePath.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return segments.Length >= 2 ? segments[^2] : "Default";
+    }
+
+    private enum SetupStep
+    {
+        Admin = 0,
+        Opc = 1,
+        Finish = 2
+    }
+
+    private enum SetupOpcMode
+    {
+        Manual,
+        Scan
+    }
+
+    private sealed class AdminDraft
+    {
+        public string Username { get; set; } = "admin";
+        public string DisplayName { get; set; } = "Local Administrator";
+        public string Password { get; set; } = string.Empty;
+        public string ConfirmPassword { get; set; } = string.Empty;
+    }
+
+    private sealed class ProfileDraft
+    {
+        public string Name { get; set; } = "Primary PLC";
+        public string EndpointUrl { get; set; } = "opc.tcp://127.0.0.1:4840";
+        public bool Enabled { get; set; }
+        public bool UseSecurity { get; set; }
+        public string SecurityPolicy { get; set; } = "None";
+        public string SecurityMode { get; set; } = "None";
+        public string AuthenticationMode { get; set; } = "Anonymous";
+        public string? Username { get; set; }
+        public string? Password { get; set; }
+        public int PublishingIntervalMs { get; set; } = 1000;
+    }
+
+    private sealed record StepCard(SetupStep Step, string Number, string Title, string Description);
 }

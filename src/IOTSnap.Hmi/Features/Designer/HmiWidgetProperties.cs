@@ -22,6 +22,8 @@ public sealed class HmiWidgetProperties
     public decimal InputStep { get; set; } = 1m;
     public string InputMode { get; set; } = "Number";
     public string? InputLabel { get; set; }
+    public string? TargetScreenSlug { get; set; }
+    public string CommandValue { get; set; } = "true";
 
     public static HmiWidgetProperties Parse(string? json)
     {
@@ -98,5 +100,12 @@ public sealed class HmiWidgetProperties
         }
 
         return parts.Count == 0 ? string.Empty : string.Join(" • ", parts);
+    }
+
+    public IReadOnlyList<string> GetKeypadButtons()
+    {
+        return InputMode.Equals("Password", StringComparison.OrdinalIgnoreCase)
+            ? new[] { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "⌫" }
+            : new[] { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", ".", "±", "⌫" };
     }
 }

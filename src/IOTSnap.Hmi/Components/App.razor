@@ -6,13 +6,27 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <base href="/" />
     <ResourcePreloader />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="_content/MudBlazor/MudBlazor.min.css" />
     <link rel="stylesheet" href="@Assets["app.css"]" />
     <link rel="stylesheet" href="@Assets["IOTSnap.Hmi.styles.css"]" />
+    <script>
+        window.hmiMarkInteractiveReady = () => {
+            document.body.dataset.hmiInteractive = "true";
+        };
+    </script>
     <ImportMap />
     <HeadOutlet @rendermode="InteractiveServer" />
 </head>
 
-<body>
+<body data-hmi-interactive="false">
+    <MudThemeProvider Theme="@WavacMudTheme.Create()" />
+    <MudPopoverProvider />
+    <MudDialogProvider />
+    <MudSnackbarProvider />
     <Routes @rendermode="InteractiveServer" />
     <script>
         window.hmiDownloadFile = async (fileName, contentStreamReference) => {
@@ -27,6 +41,7 @@
             URL.revokeObjectURL(url);
         };
     </script>
+    <script src="_content/MudBlazor/MudBlazor.min.js"></script>
     <script src="@Assets["_framework/blazor.web.js"]"></script>
 </body>
 

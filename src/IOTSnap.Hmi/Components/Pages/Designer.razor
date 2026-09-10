@@ -434,6 +434,14 @@
                     <span>Input Label</span>
                     <input @bind="_selectedEditorWidget.Properties.InputLabel" />
                 </label>
+                <label>
+                    <span>Target Screen Slug</span>
+                    <input @bind="_selectedEditorWidget.Properties.TargetScreenSlug" />
+                </label>
+                <label>
+                    <span>Command Value</span>
+                    <input @bind="_selectedEditorWidget.Properties.CommandValue" />
+                </label>
             </div>
 
             <div class="binding-editor-list">
@@ -705,7 +713,7 @@
             "DisplayName,NodeId,Area,DataType,SamplingIntervalMs,IsWritable\n"
             + "Tank Level,ns=2;s=Plant.Tank.Level,Process,double,1000,false\n"
             + "Line Speed,ns=2;s=Plant.Line.Speed,Process,double,500,false\n"
-            + "Start Command,ns=2;s=Plant.Line.Start,Commands,bool,250,true\n";
+            + "Start Command,ns=3;s=Plant.Line.Start,Commands,bool,250,true\n";
     }
 
     private async Task OnCsvFileSelectedAsync(InputFileChangeEventArgs e)

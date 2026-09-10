@@ -3,6 +3,9 @@
 @using Microsoft.AspNetCore.Identity
 @inject IDbContextFactory<HmiDbContext> DbContextFactory
 @inject IPasswordHasher<LocalUser> PasswordHasher
+@inject AuthenticationStateProvider AuthenticationStateProvider
+@inject RuntimeAuditService AuditService
+@using IOTSnap.Hmi.Features.Designer
 
 <PageTitle>Users</PageTitle>
 
@@ -146,6 +149,7 @@
         user.PasswordHash = PasswordHasher.HashPassword(user, _newPassword);
         db.LocalUsers.Add(user);
         await db.SaveChangesAsync();
+        await RecordAuditAsync("UserCreated", user.Username, "Succeeded");
 
         _newUsername = string.Empty;
         _newDisplayName = string.Empty;
@@ -177,6 +181,7 @@
 
         user.IsEnabled = !user.IsEnabled;
         await db.SaveChangesAsync();
+        await RecordAuditAsync("UserEnabledStateChanged", user.Username, user.IsEnabled ? "Enabled" : "Disabled");
         SetMessage($"{user.Username} is now {(user.IsEnabled ? "enabled" : "disabled")}.", false);
         await LoadUsersAsync();
     }
@@ -201,6 +206,7 @@
 
         user.PasswordHash = PasswordHasher.HashPassword(user, newPassword);
         await db.SaveChangesAsync();
+        await RecordAuditAsync("UserPasswordChanged", user.Username, "Succeeded");
         SetMessage($"Password updated for {user.Username}.", false);
         await LoadUsersAsync();
     }
@@ -209,6 +215,12 @@
     {
         _message = message;
         _messageIsError = isError;
+    }
+
+    private async Task RecordAuditAsync(string action, string resource, string result)
+    {
+        var actor = RuntimeAccessPolicy.ResolveActor((await AuthenticationStateProvider.GetAuthenticationStateAsync()).User);
+        if (actor is not null) await AuditService.RecordAsync(actor, action, resource, result, null, null, CancellationToken.None);
     }
 
     private sealed class UserRow

@@ -87,6 +87,39 @@ namespace IOTSnap.Hmi.Data.Migrations
                     b.ToTable("HmiScreens");
                 });
 
+            modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.HmiScreenPublication", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("HmiScreenId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PublishedBy")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("PublishedUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Slug")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SnapshotJson")
+                        .IsRequired()
+                        .HasMaxLength(20000)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("HmiScreenId", "PublishedUtc");
+
+                    b.ToTable("HmiScreenPublications");
+                });
+
             modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.HmiWidget", b =>
                 {
                     b.Property<int>("Id")
@@ -287,6 +320,11 @@ namespace IOTSnap.Hmi.Data.Migrations
                         .HasMaxLength(256)
                         .HasColumnType("TEXT");
 
+                    b.Property<int>("Severity")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(500);
+
                     b.Property<string>("StatusCode")
                         .IsRequired()
                         .HasMaxLength(64)
@@ -298,6 +336,44 @@ namespace IOTSnap.Hmi.Data.Migrations
                         .IsUnique();
 
                     b.ToTable("OpcUaAlarmStates");
+                });
+
+            modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.OpcUaAlarmTransition", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ActorUsername")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Detail")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("OccurredUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Severity")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Transition")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NodeId", "OccurredUtc");
+
+                    b.ToTable("OpcUaAlarmTransitions");
                 });
 
             modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.OpcUaConnectionProfile", b =>
@@ -325,6 +401,10 @@ namespace IOTSnap.Hmi.Data.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Password")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ProtectedPassword")
+                        .HasMaxLength(2048)
                         .HasColumnType("TEXT");
 
                     b.Property<int>("PublishingIntervalMs")
@@ -395,6 +475,177 @@ namespace IOTSnap.Hmi.Data.Migrations
                     b.HasIndex("OpcUaConnectionProfileId");
 
                     b.ToTable("OpcUaNodeMappings");
+                });
+
+            modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.OpcUaTrendSample", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("SampledUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("StatusCode")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ValueText")
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("NodeId", "SampledUtc");
+
+                    b.ToTable("OpcUaTrendSamples");
+                });
+
+            modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.OperatorAuditEntry", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ActionType")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ActorRole")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ActorUsername")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationId")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Detail")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("OccurredUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Resource")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Result")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("OccurredUtc");
+
+                    b.ToTable("OperatorAuditEntries");
+                });
+
+            modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.OperatorCommand", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTimeOffset?>("AcceptedUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ActorRole")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ActorUsername")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BindingRole")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CommandId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset?>("CompletedUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset?>("ConfirmationExpiresUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("IdempotencyKey")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("NodeId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset?>("ObservedUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ObservedValue")
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OpcUaResponse")
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTimeOffset>("RequestedUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("RequestedValue")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("RequiresConfirmation")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ScreenSlug")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("WidgetKey")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CommandId")
+                        .IsUnique();
+
+                    b.HasIndex("ActorUsername", "IdempotencyKey")
+                        .IsUnique();
+
+                    b.ToTable("OperatorCommands");
                 });
 
             modelBuilder.Entity("IOTSnap.Hmi.Data.Entities.HmiWidget", b =>

@@ -4,16 +4,20 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.DataProtection;
 using Opc.Ua;
 using Opc.Ua.Client;
 using Opc.Ua.Configuration;
 using System.Text;
+using System.Threading.Channels;
 
 namespace IOTSnap.Hmi.Runtime.OpcUa;
 
 public sealed class OpcUaRuntimeService(
     IDbContextFactory<HmiDbContext> dbContextFactory,
-    ILogger<OpcUaRuntimeService> logger) : BackgroundService, IOpcUaRuntime
+    ILogger<OpcUaRuntimeService> logger,
+    IDataProtectionProvider dataProtectionProvider,
+    IHostEnvironment hostEnvironment) : BackgroundService, IOpcUaRuntime
 {
     private static readonly ITelemetryContext Telemetry = DefaultTelemetry.Create(_ => { });
     private readonly SemaphoreSlim _statusLock = new(1, 1);
@@ -22,9 +26,23 @@ public sealed class OpcUaRuntimeService(
     private ISession? _session;
     private Subscription? _subscription;
     private int? _activeProfileId;
+    private string? _activeSubscriptionSignature;
+    private int _activeMonitoredCount;
+    private long _receivedNotificationCount;
+    private long _persistedTrendSampleCount;
+    private string? _lastSampleNodeId;
+    private string? _lastSampleValueText;
+    private string? _lastTrendPersistenceError;
     private OpcUaRuntimeStatus _status = new();
     private readonly Dictionary<string, OpcUaTagSnapshot> _tagSnapshots = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, MonitoredNodeConfiguration> _configuredNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _tagSnapshotLock = new(1, 1);
+    private readonly Channel<TrendSampleWrite> _trendSampleChannel = Channel.CreateUnbounded<TrendSampleWrite>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
 
     public async Task<OpcUaRuntimeStatus> GetStatusAsync(CancellationToken cancellationToken = default)
     {
@@ -60,8 +78,12 @@ public sealed class OpcUaRuntimeService(
             query = query.Where(x => x.IsActive || !x.IsAcknowledged);
         }
 
-        return await query
+        var alarms = await query
+            .ToListAsync(cancellationToken);
+
+        return alarms
             .OrderByDescending(x => x.IsActive)
+            .ThenByDescending(x => x.Severity)
             .ThenByDescending(x => x.LastUpdatedUtc)
             .Select(x => new OpcUaAlarmSnapshot
             {
@@ -72,6 +94,7 @@ public sealed class OpcUaRuntimeService(
                 StatusCode = x.StatusCode,
                 LastValueText = x.LastValueText,
                 AlarmText = x.AlarmText,
+                Severity = x.Severity,
                 IsActive = x.IsActive,
                 IsAcknowledged = x.IsAcknowledged,
                 FirstRaisedUtc = x.FirstRaisedUtc,
@@ -81,7 +104,7 @@ public sealed class OpcUaRuntimeService(
                 ClearedUtc = x.ClearedUtc,
                 LastUpdatedUtc = x.LastUpdatedUtc
             })
-            .ToListAsync(cancellationToken);
+            .ToList();
     }
 
     public async Task<OpcUaTagWriteResult> WriteTagAsync(string nodeId, string valueText, CancellationToken cancellationToken = default)
@@ -210,10 +233,20 @@ public sealed class OpcUaRuntimeService(
             };
         }
 
+        if (alarm.IsAcknowledged)
+        {
+            return new OpcUaAlarmCommandResult
+            {
+                Succeeded = true,
+                Message = $"Alarm is already acknowledged for {alarm.DisplayName}."
+            };
+        }
+
         alarm.IsAcknowledged = true;
         alarm.AcknowledgedBy = string.IsNullOrWhiteSpace(acknowledgedBy) ? "unknown" : acknowledgedBy.Trim();
         alarm.AcknowledgedUtc = DateTimeOffset.UtcNow;
         alarm.LastUpdatedUtc = DateTimeOffset.UtcNow;
+        db.OpcUaAlarmTransitions.Add(new OpcUaAlarmTransition { NodeId = nodeId, Transition = "Acknowledged", Severity = alarm.Severity, ActorUsername = alarm.AcknowledgedBy, Detail = alarm.AlarmText, OccurredUtc = alarm.AcknowledgedUtc.Value });
         await db.SaveChangesAsync(cancellationToken);
 
         return new OpcUaAlarmCommandResult
@@ -244,11 +277,23 @@ public sealed class OpcUaRuntimeService(
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("OPC UA runtime service started");
+        var consecutiveFailures = 0;
+        var trendWriterTask = DrainTrendSamplesAsync(stoppingToken);
 
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            await RefreshStatusAsync(stoppingToken);
-            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                await RefreshStatusAsync(stoppingToken);
+                var status = await GetStatusAsync(stoppingToken);
+                consecutiveFailures = status.IsConnected ? 0 : consecutiveFailures + 1;
+                await Task.Delay(OpcUaReconnectPolicy.GetDelay(consecutiveFailures), stoppingToken);
+            }
+        }
+        finally
+        {
+            _trendSampleChannel.Writer.TryComplete();
+            await trendWriterTask;
         }
     }
 
@@ -265,10 +310,10 @@ public sealed class OpcUaRuntimeService(
         {
             await using var db = await dbContextFactory.CreateDbContextAsync(cancellationToken);
 
-            var profile = await db.OpcUaConnectionProfiles
+            var profiles = await db.OpcUaConnectionProfiles
                 .Include(x => x.NodeMappings)
-                .OrderByDescending(x => x.UpdatedUtc)
-                .FirstOrDefaultAsync(cancellationToken);
+                .ToListAsync(cancellationToken);
+            var profile = profiles.OrderByDescending(x => x.UpdatedUtc).FirstOrDefault();
 
             if (profile is null)
             {
@@ -280,6 +325,14 @@ public sealed class OpcUaRuntimeService(
                     UpdatedUtc = DateTimeOffset.UtcNow
                 }, cancellationToken);
                 return;
+            }
+
+            if (string.IsNullOrWhiteSpace(profile.ProtectedPassword) && !string.IsNullOrWhiteSpace(profile.Password))
+            {
+                profile.ProtectedPassword = dataProtectionProvider.CreateProtector("IOTSnap.Hmi.OpcUaProfilePassword.v1").Protect(profile.Password);
+                profile.Password = null;
+                profile.UpdatedUtc = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync(cancellationToken);
             }
 
             var endpointIsValid = Uri.TryCreate(profile.EndpointUrl, UriKind.Absolute, out var endpointUri)
@@ -316,6 +369,11 @@ public sealed class OpcUaRuntimeService(
             }
 
             var sessionResult = await EnsureSessionAndSubscriptionAsync(profile, cancellationToken);
+            var sampleDiagnostics = $"Samples received={_receivedNotificationCount}, persisted={_persistedTrendSampleCount}, lastNode={_lastSampleNodeId ?? "n/a"}";
+            if (!string.IsNullOrWhiteSpace(_lastTrendPersistenceError))
+            {
+                sampleDiagnostics = $"{sampleDiagnostics}, lastPersistError={_lastTrendPersistenceError}";
+            }
 
             await SetStatusAsync(new OpcUaRuntimeStatus
             {
@@ -324,7 +382,7 @@ public sealed class OpcUaRuntimeService(
                 EndpointUrl = profile.EndpointUrl,
                 ConfiguredNodeCount = profile.NodeMappings.Count,
                 UpdatedUtc = DateTimeOffset.UtcNow,
-                Detail = sessionResult.Detail
+                Detail = $"{sessionResult.Detail} {sampleDiagnostics}"
             }, cancellationToken);
 
             await SynchronizeAlarmStateAsync(cancellationToken);
@@ -365,24 +423,27 @@ public sealed class OpcUaRuntimeService(
         await _sessionLock.WaitAsync(cancellationToken);
         try
         {
+            var subscriptionSignature = BuildSubscriptionSignature(profile);
             if (_session is not null
                 && _session.Connected
                 && _activeProfileId == profile.Id)
             {
+                if (string.Equals(_activeSubscriptionSignature, subscriptionSignature, StringComparison.Ordinal))
+                {
+                    return (true, $"Connected. Monitoring {_activeMonitoredCount} node(s).");
+                }
+
                 var monitoredCount = await RebuildSubscriptionAsync(_session, profile, cancellationToken);
+                await RefreshMappedNodeValuesAsync(_session, profile, cancellationToken);
+                _activeSubscriptionSignature = subscriptionSignature;
+                _activeMonitoredCount = monitoredCount;
                 return (true, $"Connected. Monitoring {monitoredCount} node(s).");
             }
 
             await DisconnectSessionInternalAsync(cancellationToken);
 
             var config = await BuildAppConfigurationAsync(cancellationToken);
-            var endpointDescription = await CoreClientUtils.SelectEndpointAsync(
-                config,
-                profile.EndpointUrl,
-                profile.UseSecurity,
-                15000,
-                Telemetry,
-                cancellationToken);
+            var endpointDescription = await SelectConfiguredEndpointAsync(config, profile, cancellationToken);
             var endpoint = new ConfiguredEndpoint(null, endpointDescription, EndpointConfiguration.Create(config));
 
             var identity = BuildUserIdentity(profile);
@@ -399,6 +460,9 @@ public sealed class OpcUaRuntimeService(
 
             _activeProfileId = profile.Id;
             var totalMonitoredItems = await RebuildSubscriptionAsync(_session, profile, cancellationToken);
+            await RefreshMappedNodeValuesAsync(_session, profile, cancellationToken);
+            _activeSubscriptionSignature = subscriptionSignature;
+            _activeMonitoredCount = totalMonitoredItems;
 
             return (_session.Connected, $"Connected. Monitoring {totalMonitoredItems} node(s).");
         }
@@ -414,20 +478,125 @@ public sealed class OpcUaRuntimeService(
         }
     }
 
-    private static IUserIdentity BuildUserIdentity(OpcUaConnectionProfile profile)
+    private static string BuildSubscriptionSignature(OpcUaConnectionProfile profile)
+        => string.Join('|', profile.NodeMappings
+            .OrderBy(x => x.NodeId, StringComparer.Ordinal)
+            .Select(x => $"{x.NodeId}:{x.SamplingIntervalMs}:{x.IsWritable}"));
+
+    private static async Task<EndpointDescription> SelectConfiguredEndpointAsync(
+        ApplicationConfiguration config,
+        OpcUaConnectionProfile profile,
+        CancellationToken cancellationToken)
     {
+        var endpointConfiguration = EndpointConfiguration.Create(config);
+        using var discoveryClient = await DiscoveryClient.CreateAsync(
+            config,
+            new Uri(profile.EndpointUrl),
+            endpointConfiguration,
+            DiagnosticsMasks.None,
+            cancellationToken);
+
+        var endpoints = await discoveryClient.GetEndpointsAsync(null, cancellationToken);
+        var matchedEndpoint = FindMatchingEndpoint(endpoints, profile);
+        if (matchedEndpoint is not null)
+        {
+            return matchedEndpoint;
+        }
+
+        var availableProfiles = string.Join(", ", endpoints.Select(DescribeEndpoint));
+        throw new ServiceResultException(
+            StatusCodes.BadConfigurationError,
+            $"No OPC UA endpoint matches UseSecurity={profile.UseSecurity}, SecurityPolicy={profile.SecurityPolicy}, SecurityMode={profile.SecurityMode}. Available endpoints: {availableProfiles}");
+    }
+
+    private static EndpointDescription? FindMatchingEndpoint(
+        EndpointDescriptionCollection endpoints,
+        OpcUaConnectionProfile profile)
+    {
+        var desiredPolicyUri = ResolveSecurityPolicyUri(profile.UseSecurity, profile.SecurityPolicy);
+        var desiredSecurityMode = ResolveSecurityMode(profile.UseSecurity, profile.SecurityMode);
+
+        return endpoints
+            .Where(endpoint => string.Equals(endpoint.TransportProfileUri, Profiles.UaTcpTransport, StringComparison.Ordinal))
+            .Where(endpoint => string.Equals(endpoint.SecurityPolicyUri ?? SecurityPolicies.None, desiredPolicyUri, StringComparison.Ordinal))
+            .Where(endpoint => endpoint.SecurityMode == desiredSecurityMode)
+            .OrderByDescending(endpoint => endpoint.SecurityLevel)
+            .ThenBy(endpoint => endpoint.EndpointUrl, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+    }
+
+    private static string ResolveSecurityPolicyUri(bool useSecurity, string? securityPolicy)
+    {
+        if (!useSecurity)
+        {
+            return SecurityPolicies.None;
+        }
+
+        return (securityPolicy ?? string.Empty).Trim() switch
+        {
+            "" => SecurityPolicies.Basic256Sha256,
+            nameof(SecurityPolicies.None) => SecurityPolicies.None,
+            nameof(SecurityPolicies.Basic128Rsa15) => SecurityPolicies.Basic128Rsa15,
+            nameof(SecurityPolicies.Basic256) => SecurityPolicies.Basic256,
+            nameof(SecurityPolicies.Basic256Sha256) => SecurityPolicies.Basic256Sha256,
+            nameof(SecurityPolicies.Aes128_Sha256_RsaOaep) => SecurityPolicies.Aes128_Sha256_RsaOaep,
+            nameof(SecurityPolicies.Aes256_Sha256_RsaPss) => SecurityPolicies.Aes256_Sha256_RsaPss,
+            var policy when policy.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || policy.StartsWith("https://", StringComparison.OrdinalIgnoreCase) => policy,
+            var policy => throw new ServiceResultException(
+                StatusCodes.BadConfigurationError,
+                $"Unsupported OPC UA security policy '{policy}'.")
+        };
+    }
+
+    private static MessageSecurityMode ResolveSecurityMode(bool useSecurity, string? securityMode)
+    {
+        if (!useSecurity)
+        {
+            return MessageSecurityMode.None;
+        }
+
+        return Enum.TryParse<MessageSecurityMode>(securityMode, ignoreCase: true, out var parsedMode)
+            ? parsedMode
+            : throw new ServiceResultException(
+                StatusCodes.BadConfigurationError,
+                $"Unsupported OPC UA security mode '{securityMode}'.");
+    }
+
+    private static string DescribeEndpoint(EndpointDescription endpoint)
+        => $"{endpoint.EndpointUrl} [{endpoint.SecurityPolicyUri ?? SecurityPolicies.None} / {endpoint.SecurityMode}]";
+
+    private IUserIdentity BuildUserIdentity(OpcUaConnectionProfile profile)
+    {
+        var password = GetPassword(profile);
         if (string.Equals(profile.AuthenticationMode, "UsernamePassword", StringComparison.OrdinalIgnoreCase)
             && !string.IsNullOrWhiteSpace(profile.Username)
-            && !string.IsNullOrWhiteSpace(profile.Password))
+            && !string.IsNullOrWhiteSpace(password))
         {
             return new UserIdentity(new UserNameIdentityToken
             {
                 UserName = profile.Username,
-                DecryptedPassword = Encoding.UTF8.GetBytes(profile.Password)
+                DecryptedPassword = Encoding.UTF8.GetBytes(password)
             });
         }
 
         return new UserIdentity(new AnonymousIdentityToken());
+    }
+
+    private string? GetPassword(OpcUaConnectionProfile profile)
+    {
+        if (string.IsNullOrWhiteSpace(profile.ProtectedPassword)) return null;
+
+        try
+        {
+            return dataProtectionProvider.CreateProtector("IOTSnap.Hmi.OpcUaProfilePassword.v1")
+                .Unprotect(profile.ProtectedPassword);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not decrypt OPC UA credentials for profile {ProfileName}", profile.Name);
+            return null;
+        }
     }
 
     private static bool TryConvertValue(string valueText, string dataType, out object typedValue, out string error)
@@ -526,8 +695,10 @@ public sealed class OpcUaRuntimeService(
         return false;
     }
 
-    private static async Task<ApplicationConfiguration> BuildAppConfigurationAsync(CancellationToken cancellationToken)
+    private async Task<ApplicationConfiguration> BuildAppConfigurationAsync(CancellationToken cancellationToken)
     {
+        OpcUaCertificateStorePaths.EnsureDirectories(hostEnvironment);
+
         var config = new ApplicationConfiguration
         {
             ApplicationName = "IOTSnap.Hmi",
@@ -538,23 +709,23 @@ public sealed class OpcUaRuntimeService(
                 ApplicationCertificate = new CertificateIdentifier
                 {
                     StoreType = CertificateStoreType.Directory,
-                    StorePath = "OPC Foundation/CertificateStores/MachineDefault",
+                    StorePath = OpcUaCertificateStorePaths.GetOwnDirectory(hostEnvironment),
                     SubjectName = "CN=IOTSnap.Hmi"
                 },
                 TrustedIssuerCertificates = new CertificateTrustList
                 {
                     StoreType = CertificateStoreType.Directory,
-                    StorePath = "OPC Foundation/CertificateStores/UA Certificate Authorities"
+                    StorePath = OpcUaCertificateStorePaths.GetTrustedIssuerDirectory(hostEnvironment)
                 },
                 TrustedPeerCertificates = new CertificateTrustList
                 {
                     StoreType = CertificateStoreType.Directory,
-                    StorePath = "OPC Foundation/CertificateStores/UA Applications"
+                    StorePath = OpcUaCertificateStorePaths.GetTrustedPeerDirectory(hostEnvironment)
                 },
                 RejectedCertificateStore = new CertificateTrustList
                 {
                     StoreType = CertificateStoreType.Directory,
-                    StorePath = "OPC Foundation/CertificateStores/RejectedCertificates"
+                    StorePath = OpcUaCertificateStorePaths.GetRejectedDirectory(hostEnvironment)
                 },
                 AutoAcceptUntrustedCertificates = true,
                 AddAppCertToTrustedStore = true
@@ -571,6 +742,13 @@ public sealed class OpcUaRuntimeService(
         };
 
         await config.ValidateAsync(ApplicationType.Client);
+        var application = new ApplicationInstance(Telemetry)
+        {
+            ApplicationName = config.ApplicationName,
+            ApplicationType = ApplicationType.Client,
+            ApplicationConfiguration = config
+        };
+        await application.CheckApplicationInstanceCertificatesAsync(false, 2048, cancellationToken);
         config.CertificateValidator.CertificateValidation += (_, e) => { e.Accept = true; };
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -602,14 +780,16 @@ public sealed class OpcUaRuntimeService(
 
         var monitoredCount = 0;
         var seedSnapshots = new Dictionary<string, OpcUaTagSnapshot>(StringComparer.OrdinalIgnoreCase);
+        var configuredNodes = new Dictionary<string, MonitoredNodeConfiguration>(StringComparer.OrdinalIgnoreCase);
         foreach (var node in profile.NodeMappings)
         {
             try
             {
+                var configuredNodeId = NormalizeNodeId(node.NodeId);
                 var monitoredItem = new MonitoredItem(subscription.DefaultItem)
                 {
                     DisplayName = node.DisplayName,
-                    StartNodeId = NodeId.Parse(node.NodeId),
+                    StartNodeId = NodeId.Parse(configuredNodeId),
                     AttributeId = Attributes.Value,
                     SamplingInterval = Math.Max(100, node.SamplingIntervalMs),
                     QueueSize = 1,
@@ -618,10 +798,10 @@ public sealed class OpcUaRuntimeService(
 
                 monitoredItem.Notification += HandleMonitoredItemNotification;
                 subscription.AddItem(monitoredItem);
-                seedSnapshots[node.NodeId] = new OpcUaTagSnapshot
+                seedSnapshots[configuredNodeId] = new OpcUaTagSnapshot
                 {
                     DisplayName = node.DisplayName,
-                    NodeId = node.NodeId,
+                    NodeId = configuredNodeId,
                     Area = node.Area,
                     DataType = node.DataType,
                     IsWritable = node.IsWritable,
@@ -631,6 +811,13 @@ public sealed class OpcUaRuntimeService(
                     StatusCode = "Unknown",
                     AlarmText = "Pending first update"
                 };
+                configuredNodes[configuredNodeId] = new MonitoredNodeConfiguration(
+                    configuredNodeId,
+                    node.DisplayName,
+                    node.Area,
+                    node.DataType,
+                    node.IsWritable,
+                    Math.Max(100, node.SamplingIntervalMs));
                 monitoredCount++;
             }
             catch (Exception ex)
@@ -643,9 +830,15 @@ public sealed class OpcUaRuntimeService(
         try
         {
             _tagSnapshots.Clear();
+            _configuredNodes.Clear();
             foreach (var item in seedSnapshots)
             {
                 _tagSnapshots[item.Key] = item.Value;
+            }
+
+            foreach (var item in configuredNodes)
+            {
+                _configuredNodes[item.Key] = item.Value;
             }
         }
         finally
@@ -672,41 +865,148 @@ public sealed class OpcUaRuntimeService(
             return;
         }
 
-        var nodeId = monitoredItem.ResolvedNodeId?.ToString() ?? monitoredItem.StartNodeId?.ToString() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(nodeId))
+        var configuredNodeId = ResolveConfiguredNodeId(monitoredItem.StartNodeId?.ToString(), monitoredItem.ResolvedNodeId?.ToString());
+        if (string.IsNullOrWhiteSpace(configuredNodeId))
         {
             return;
         }
 
-        var valueText = value.WrappedValue.Value?.ToString();
         var timestamp = value.SourceTimestamp == DateTime.MinValue
             ? (DateTimeOffset?)null
             : new DateTimeOffset(DateTime.SpecifyKind(value.SourceTimestamp, DateTimeKind.Utc));
+        Interlocked.Increment(ref _receivedNotificationCount);
+        RecordTagValue(configuredNodeId, monitoredItem.DisplayName, value, timestamp, persistTrendSample: true);
+    }
+
+    private async Task DrainTrendSamplesAsync(CancellationToken cancellationToken)
+    {
+        var reader = _trendSampleChannel.Reader;
+        while (await reader.WaitToReadAsync(cancellationToken))
+        {
+            var batch = new List<TrendSampleWrite>();
+            while (reader.TryRead(out var sample))
+            {
+                batch.Add(sample);
+                if (batch.Count >= 64)
+                {
+                    break;
+                }
+            }
+
+            if (batch.Count == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                await using var db = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+                foreach (var sample in batch)
+                {
+                    db.OpcUaTrendSamples.Add(new OpcUaTrendSample
+                    {
+                        NodeId = sample.NodeId,
+                        ValueText = sample.ValueText,
+                        StatusCode = sample.StatusCode,
+                        SampledUtc = sample.SampledUtc
+                    });
+                }
+
+                await db.SaveChangesAsync(cancellationToken);
+                await DeleteExpiredTrendSamplesAsync(db, batch.Max(x => x.SampledUtc), cancellationToken);
+                Interlocked.Add(ref _persistedTrendSampleCount, batch.Count);
+                var lastSample = batch[^1];
+                _lastSampleNodeId = lastSample.NodeId;
+                _lastSampleValueText = lastSample.ValueText;
+                _lastTrendPersistenceError = null;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _lastTrendPersistenceError = ex.Message;
+                logger.LogWarning(ex, "Failed to persist {Count} OPC UA trend sample(s)", batch.Count);
+            }
+        }
+    }
+
+    private async Task RefreshMappedNodeValuesAsync(
+        ISession session,
+        OpcUaConnectionProfile profile,
+        CancellationToken cancellationToken)
+    {
+        var samples = new List<TrendSampleWrite>(profile.NodeMappings.Count);
+
+        foreach (var node in profile.NodeMappings)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var configuredNodeId = NormalizeNodeId(node.NodeId);
+                var value = await session.ReadValueAsync(NodeId.Parse(configuredNodeId), cancellationToken);
+                if (value is null)
+                {
+                    continue;
+                }
+
+                var timestamp = value.SourceTimestamp == DateTime.MinValue
+                    ? (DateTimeOffset?)null
+                    : new DateTimeOffset(DateTime.SpecifyKind(value.SourceTimestamp, DateTimeKind.Utc));
+                RecordTagValue(configuredNodeId, node.DisplayName, value, timestamp, persistTrendSample: false);
+                samples.Add(new TrendSampleWrite(configuredNodeId, value.WrappedValue.Value?.ToString(), value.StatusCode.ToString(), DateTimeOffset.UtcNow));
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "Initial/read refresh failed for OPC UA node {NodeId}", node.NodeId);
+            }
+        }
+
+        await PersistTrendSamplesAsync(samples, cancellationToken);
+    }
+
+    private void RecordTagValue(
+        string configuredNodeId,
+        string? displayName,
+        DataValue value,
+        DateTimeOffset? sourceTimestampUtc,
+        bool persistTrendSample)
+    {
+        var normalizedNodeId = NormalizeNodeId(configuredNodeId);
+        var valueText = value.WrappedValue.Value?.ToString();
         var updatedUtc = DateTimeOffset.UtcNow;
+
+        if (persistTrendSample)
+        {
+            _trendSampleChannel.Writer.TryWrite(new TrendSampleWrite(normalizedNodeId, valueText, value.StatusCode.ToString(), updatedUtc));
+        }
 
         _tagSnapshotLock.Wait();
         try
         {
-            if (!_tagSnapshots.TryGetValue(nodeId, out var existing))
+            if (!_tagSnapshots.TryGetValue(normalizedNodeId, out var existing))
             {
-                _tagSnapshots[nodeId] = new OpcUaTagSnapshot
+                _configuredNodes.TryGetValue(normalizedNodeId, out var configured);
+                _tagSnapshots[normalizedNodeId] = new OpcUaTagSnapshot
                 {
-                    DisplayName = monitoredItem.DisplayName,
-                    NodeId = nodeId,
-                    Area = "Live",
-                    DataType = "Auto",
-                    IsWritable = false,
-                    SamplingIntervalMs = 1000,
+                    DisplayName = configured?.DisplayName ?? displayName ?? normalizedNodeId,
+                    NodeId = normalizedNodeId,
+                    Area = configured?.Area ?? "Live",
+                    DataType = configured?.DataType ?? "Auto",
+                    IsWritable = configured?.IsWritable ?? false,
+                    SamplingIntervalMs = configured?.SamplingIntervalMs ?? 1000,
                     ValueText = valueText,
                     StatusCode = value.StatusCode.ToString(),
-                    SourceTimestampUtc = timestamp,
+                    SourceTimestampUtc = sourceTimestampUtc,
                     UpdatedUtc = updatedUtc,
                     AlarmText = string.Empty
                 };
                 return;
             }
 
-            _tagSnapshots[nodeId] = new OpcUaTagSnapshot
+            _tagSnapshots[normalizedNodeId] = new OpcUaTagSnapshot
             {
                 DisplayName = existing.DisplayName,
                 NodeId = existing.NodeId,
@@ -716,7 +1016,7 @@ public sealed class OpcUaRuntimeService(
                 SamplingIntervalMs = existing.SamplingIntervalMs,
                 ValueText = valueText,
                 StatusCode = value.StatusCode.ToString(),
-                SourceTimestampUtc = timestamp,
+                SourceTimestampUtc = sourceTimestampUtc,
                 UpdatedUtc = updatedUtc,
                 AlarmText = string.Empty
             };
@@ -724,6 +1024,96 @@ public sealed class OpcUaRuntimeService(
         finally
         {
             _tagSnapshotLock.Release();
+        }
+    }
+
+    private string ResolveConfiguredNodeId(string? startNodeId, string? resolvedNodeId)
+    {
+        foreach (var candidate in new[] { startNodeId, resolvedNodeId })
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            var normalized = NormalizeNodeId(candidate);
+            if (_configuredNodes.ContainsKey(normalized))
+            {
+                return normalized;
+            }
+        }
+
+        return NormalizeNodeId(startNodeId ?? resolvedNodeId ?? string.Empty);
+    }
+
+    private async Task PersistTrendSamplesAsync(
+        IReadOnlyList<TrendSampleWrite> samples,
+        CancellationToken cancellationToken)
+    {
+        if (samples.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await using var db = await dbContextFactory.CreateDbContextAsync(cancellationToken);
+            foreach (var sample in samples)
+            {
+                db.OpcUaTrendSamples.Add(new OpcUaTrendSample
+                {
+                    NodeId = sample.NodeId,
+                    ValueText = sample.ValueText,
+                    StatusCode = sample.StatusCode,
+                    SampledUtc = sample.SampledUtc
+                });
+            }
+
+            await db.SaveChangesAsync(cancellationToken);
+            await DeleteExpiredTrendSamplesAsync(db, samples.Max(x => x.SampledUtc), cancellationToken);
+
+            Interlocked.Add(ref _persistedTrendSampleCount, samples.Count);
+            var lastSample = samples[^1];
+            _lastSampleNodeId = lastSample.NodeId;
+            _lastSampleValueText = lastSample.ValueText;
+            _lastTrendPersistenceError = null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _lastTrendPersistenceError = ex.Message;
+            logger.LogWarning(ex, "Failed to persist {Count} OPC UA trend sample(s)", samples.Count);
+        }
+    }
+
+    private static async Task DeleteExpiredTrendSamplesAsync(
+        HmiDbContext db,
+        DateTimeOffset newestSampleUtc,
+        CancellationToken cancellationToken)
+    {
+        var retentionCutoff = newestSampleUtc.AddDays(-30);
+        await db.OpcUaTrendSamples
+            .Where(x => x.SampledUtc < retentionCutoff)
+            .ExecuteDeleteAsync(cancellationToken);
+    }
+
+    private static string NormalizeNodeId(string nodeId)
+    {
+        if (string.IsNullOrWhiteSpace(nodeId))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return NodeId.Parse(nodeId).ToString();
+        }
+        catch
+        {
+            return nodeId.Trim();
         }
     }
 
@@ -763,6 +1153,10 @@ public sealed class OpcUaRuntimeService(
             AlarmText = alarmText
         };
     }
+
+    private static int GetAlarmSeverity(OpcUaTagSnapshot snapshot)
+        => snapshot.IsStale ? 700
+            : (snapshot.StatusCode?.StartsWith("Good", StringComparison.OrdinalIgnoreCase) == true ? 0 : 500);
 
     private async Task SynchronizeAlarmStateAsync(CancellationToken cancellationToken)
     {
@@ -805,12 +1199,14 @@ public sealed class OpcUaRuntimeService(
                         StatusCode = snapshot.StatusCode ?? string.Empty,
                         LastValueText = snapshot.ValueText,
                         AlarmText = snapshot.AlarmText,
+                        Severity = GetAlarmSeverity(snapshot),
                         IsActive = true,
                         IsAcknowledged = false,
                         FirstRaisedUtc = now,
                         LastRaisedUtc = now,
                         LastUpdatedUtc = now
                     });
+                    db.OpcUaAlarmTransitions.Add(new OpcUaAlarmTransition { NodeId = snapshot.NodeId, Transition = "Raised", Severity = GetAlarmSeverity(snapshot), Detail = snapshot.AlarmText, OccurredUtc = now });
                     continue;
                 }
 
@@ -822,12 +1218,14 @@ public sealed class OpcUaRuntimeService(
                 alarm.StatusCode = snapshot.StatusCode ?? string.Empty;
                 alarm.LastValueText = snapshot.ValueText;
                 alarm.AlarmText = snapshot.AlarmText;
+                alarm.Severity = GetAlarmSeverity(snapshot);
                 alarm.LastRaisedUtc = now;
                 alarm.LastUpdatedUtc = now;
                 alarm.ClearedUtc = null;
 
                 if (wasInactive)
                 {
+                    db.OpcUaAlarmTransitions.Add(new OpcUaAlarmTransition { NodeId = snapshot.NodeId, Transition = "ReRaised", Severity = alarm.Severity, Detail = alarm.AlarmText, OccurredUtc = now });
                     alarm.IsAcknowledged = false;
                     alarm.AcknowledgedUtc = null;
                     alarm.AcknowledgedBy = null;
@@ -848,6 +1246,7 @@ public sealed class OpcUaRuntimeService(
                 alarm.ClearedUtc = now;
                 alarm.AlarmText = "Cleared";
                 alarm.LastUpdatedUtc = now;
+                db.OpcUaAlarmTransitions.Add(new OpcUaAlarmTransition { NodeId = alarm.NodeId, Transition = "Cleared", Severity = alarm.Severity, Detail = alarm.AlarmText, OccurredUtc = now });
             }
         }
 
@@ -916,6 +1315,8 @@ public sealed class OpcUaRuntimeService(
             _session.Dispose();
             _session = null;
             _activeProfileId = null;
+            _activeSubscriptionSignature = null;
+            _activeMonitoredCount = 0;
         }
 
         await _tagSnapshotLock.WaitAsync(cancellationToken);
@@ -928,4 +1329,7 @@ public sealed class OpcUaRuntimeService(
             _tagSnapshotLock.Release();
         }
     }
+
+    private sealed record TrendSampleWrite(string NodeId, string? ValueText, string? StatusCode, DateTimeOffset SampledUtc);
+    private sealed record MonitoredNodeConfiguration(string NodeId, string DisplayName, string Area, string DataType, bool IsWritable, int SamplingIntervalMs);
 }

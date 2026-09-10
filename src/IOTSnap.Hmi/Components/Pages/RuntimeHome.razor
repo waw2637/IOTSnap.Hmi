@@ -1,0 +1,38 @@
+@page "/runtime"
+@attribute [Authorize]
+@inject IDbContextFactory<HmiDbContext> DbContextFactory
+@inject NavigationManager NavigationManager
+@using IOTSnap.Hmi.Data
+@using Microsoft.EntityFrameworkCore
+
+<PageTitle>Runtime</PageTitle>
+
+<section class="page-header">
+    <div>
+        <div class="hmi-kicker">Runtime</div>
+        <h2>Opening operator screen</h2>
+    </div>
+    <p>@_message</p>
+</section>
+
+@code {
+    private string _message = "Finding the first published screen...";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbContextFactory.CreateDbContextAsync();
+        var slug = await db.HmiScreens.AsNoTracking()
+            .Where(x => x.IsPublished)
+            .OrderBy(x => x.Name)
+            .Select(x => x.Slug)
+            .FirstOrDefaultAsync();
+
+        if (string.IsNullOrWhiteSpace(slug))
+        {
+            _message = "No operator screen has been published yet.";
+            return;
+        }
+
+        NavigationManager.NavigateTo($"/runtime/{Uri.EscapeDataString(slug)}", replace: true);
+    }
+}

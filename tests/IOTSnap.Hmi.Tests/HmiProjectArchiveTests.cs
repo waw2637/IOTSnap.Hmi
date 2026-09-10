@@ -7,6 +7,20 @@ namespace IOTSnap.Hmi.Tests;
 public class HmiProjectArchiveTests
 {
     [Fact]
+    public void ReadAssets_RejectsOversizedAsset()
+    {
+        var package = HmiProjectPackage.Create(new HmiProjectPackageScreen(
+            "Archive Screen", "archive", 800, 600, false,
+            [new HmiProjectPackageWidget("value", "Numeric", "Value", 0, 0, 100, 100, 0, "{}", [])]));
+        var archiveBytes = HmiProjectPackageSerializer.CreateArchive(package, new Dictionary<string, byte[]>
+        {
+            ["large.bin"] = new byte[HmiProjectPackageSerializer.MaximumAssetBytes + 1]
+        });
+
+        Assert.Throws<InvalidDataException>(() => HmiProjectPackageSerializer.ReadAssets(archiveBytes));
+    }
+
+    [Fact]
     public void Archive_CanRoundTripManifestAndAssets()
     {
         var package = HmiProjectPackage.Create(new HmiProjectPackageScreen(

@@ -10,6 +10,7 @@ public sealed class OpcUaAlarmState
     public string StatusCode { get; set; } = string.Empty;
     public string? LastValueText { get; set; }
     public string AlarmText { get; set; } = string.Empty;
+    public int Severity { get; set; } = 500;
     public bool IsActive { get; set; }
     public bool IsAcknowledged { get; set; }
     public DateTimeOffset FirstRaisedUtc { get; set; } = DateTimeOffset.UtcNow;
