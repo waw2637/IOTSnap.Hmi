@@ -1,0 +1,67 @@
+name: IOTSnap HMI unit tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feature/**
+      - fix/**
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: b70-unit
+    steps:
+      - name: Check isolated runner boundary
+        run: |
+          set -eu
+          test "$(id -u)" = "1000"
+          test ! -S /var/run/docker.sock
+          test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
+          test "$(dotnet --version)" = "10.0.401"
+
+      - name: Check out exact revision
+        env:
+          REPOSITORY_URL: ${{ forgejo.server_url }}/${{ forgejo.repository }}.git
+          REVISION: ${{ forgejo.sha }}
+        run: |
+          set -eu
+          test -n "${GITHUB_WORKSPACE:-}"
+          test -n "${REPOSITORY_URL:-}"
+          test -n "${REVISION:-}"
+          case "$GITHUB_WORKSPACE" in
+            /data/*) ;;
+            *) echo "refusing unexpected workspace: $GITHUB_WORKSPACE" >&2; exit 2 ;;
+          esac
+          token="${FORGEJO_TOKEN:-${GITHUB_TOKEN:-}}"
+          test -n "$token"
+          auth_header="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+          unset token
+          git init "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" remote remove origin 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" remote add origin "$REPOSITORY_URL"
+          git -C "$GITHUB_WORKSPACE" \
+            -c "http.extraHeader=Authorization: Basic ${auth_header}" \
+            fetch --no-tags --depth=1 origin "$REVISION"
+          unset auth_header
+          git -C "$GITHUB_WORKSPACE" checkout --detach FETCH_HEAD
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$REVISION"
+
+      - name: Restore
+        working-directory: ${{ forgejo.workspace }}
+        run: dotnet restore IOTSnap.Hmi.slnx
+
+      - name: Build
+        working-directory: ${{ forgejo.workspace }}
+        run: dotnet build IOTSnap.Hmi.slnx --configuration Release --no-restore
+
+      - name: Test
+        working-directory: ${{ forgejo.workspace }}
+        run: >-
+          dotnet test
+          tests/IOTSnap.Hmi.Tests/IOTSnap.Hmi.Tests.csproj
+          --configuration Release
+          --no-build
+          --no-restore
+          --logger "console;verbosity=normal"
